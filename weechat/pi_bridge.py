@@ -53,6 +53,7 @@ import re
 import secrets
 import socket
 import time
+import unicodedata
 
 try:
     import weechat
@@ -100,6 +101,10 @@ FAIL_WINDOW_S = 60             # …that trigger a lockout
 LOCKOUT_S = 600                # …for this long (silent drop, no oracle)
 MAX_BYTES_PER_EVENT = 256 * 1024  # read budget per client fd event
 USER_INPUT_MAX_PER_S = 5       # buffer lines forwarded to pi per sliding 1 s
+# Idle-buffer cleanup (pi_bridge.auto_clean): how many hours a buffer whose pi
+# connection is gone may print nothing before the sweep closes it. 0 = never.
+AUTO_CLEAN_DEFAULT_HOURS = "24"   # option default (config_set_plugin wants a str)
+AUTO_CLEAN_SWEEP_S = 3600         # sweep interval; hook_timer wants milliseconds
 
 
 def _color(name):
@@ -142,6 +147,16 @@ C_ERR = _theme("chat_prefix_error", "yellow")       # errors
 C_OK = _theme("chat_status_enabled", "green")       # successes
 C_DIM = _theme("chat_host", "cyan")                  # hints / 💭 thinking lines
 C_REJECT = _color("red")                             # auth failures / security
+# Join/quit lifecycle lines. They follow the theme slots the IRC plugin colors
+# its own join/quit prefixes with: irc.color.message_join / message_quit live in
+# irc.conf, but weechat.color() cannot name a plugin color, so chat_prefix_join
+# and chat_prefix_quit are the reachable equivalent of them.
+C_JOIN = _theme("chat_prefix_join", "lightgreen")      # `-->` line: nick + text
+C_QUIT = _theme("chat_prefix_quit", "lightred")        # `<--` line: nick + text
+C_CHAN = _theme("chat_channel", "white")               # the `#channel` of a join
+# Quit reason text: irc.color.reason_quit defaults to a dark gray and has no slot
+# in weechat.conf, so this one role keeps a fixed palette color.
+C_QUIT_REASON = _color("darkgray")
 # Tool *output* body: own color, deliberately a fixed palette color (no
 # canonical WeeChat [color] slot for this role; theme-following risks
 # collapsing back onto chat_host/cyan and looking identical to thinking).
@@ -194,6 +209,38 @@ def _nick_color(nick):
     except Exception:
         name = ""
     return _color(name) or C_NICK
+
+def _lifecycle_prefix(kind):
+    """WeeChat's own join/quit prefix: color + glyph + TAB.
+
+    `kind` is "join" or "quit". `weechat.prefix()` returns exactly what the IRC
+    plugin puts in the prefix column (`-->\t` in chat_prefix_join), so printing
+    it in front of a body gives a script buffer the same column a real join or
+    quit line has. A missing lookup (older WeeChat, the test stubs, no WeeChat
+    at all) or a prefix the user switched off falls back to the literal glyphs.
+    The result always carries exactly one TAB, because WeeChat reads everything
+    before the first TAB as the line's prefix.
+    """
+    fallback = (C_JOIN + "-->") if kind == "join" else (C_QUIT + "<--")
+    if weechat is None:
+        return fallback + "\t"
+    try:
+        prefix = weechat.prefix(kind) or ""
+    except Exception:
+        prefix = ""
+    if not prefix.strip():
+        return fallback + "\t"
+    return prefix if "\t" in prefix else prefix + "\t"
+
+# Bracketed quit reasons, keyed by who closed the socket: `peer` hung up (the pi
+# side), `error` is a socket error in either direction, `bridge` means the bridge
+# closed a client it still owns (clearing tcp_listen while the script stays
+# loaded).
+QUIT_REASONS = {
+    "peer": "Client Quit",
+    "error": "Connection reset by peer",
+    "bridge": "Connection closed",
+}
 
 # --------------------------------------------- syntax highlighting (fences)
 
@@ -413,6 +460,7 @@ MD_BLOCK_QUOTE = "quote"
 MD_BLOCK_HEADING = "heading"
 MD_BLOCK_HR = "hr"
 MD_BLOCK_SETEXT = "setext"
+MD_BLOCK_TABLE = "table"
 
 
 def _md_block_kind(line):
@@ -516,6 +564,133 @@ def _md_list_items(lines):
             items.append(("", line))
     return items
 
+
+# Tables (GitHub-flavored): a header row with at least one unescaped | followed by a
+# delimiter row of dash cells; the colon placement in a delimiter cell sets that
+# column's alignment. A table cannot be laid out before its last row arrives (the
+# column widths come from every cell), so it is buffered like the other blocks
+# (see _print_assistant) — with caps, so a runaway table cannot stall the buffer.
+MD_TABLE_ALIGN_RE = re.compile(r"^:?-+:?$")
+MD_TABLE_LEFT = "left"
+MD_TABLE_RIGHT = "right"
+MD_TABLE_CENTER = "center"
+MD_TABLE_MAX_ROWS = 200          # rows buffered before the block flushes as plain text
+MD_TABLE_MAX_BYTES = 64 * 1024   # …and the size cap on the same block
+
+
+def _md_split_row(line):
+    """One table line → raw cell texts, inline markdown left untouched.
+
+    Split on a `|` that is neither backslash-escaped nor inside a backtick code span,
+    so `\\|` and `` `a|b` `` stay inside their own cell. Both forms become a literal
+    `|` for display — WeeChat has no escape for it, and the inline renderer would
+    otherwise print the backslash. One leading and one trailing pipe are stripped;
+    both are optional in GFM.
+    """
+    cells = []
+    buf = []
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append("|" if line[i + 1] == "|" else ch + line[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < n and line[j] == "`":
+                j += 1
+            run = line[i:j]
+            close = line.find(run, j)
+            body = line[j:close] if close >= 0 else line[j:]
+            buf.append(run + body.replace("\\|", "|") + (run if close >= 0 else ""))
+            i = close + len(run) if close >= 0 else n
+            continue
+        if ch == "|":
+            cells.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf))
+    if len(cells) > 1:
+        if not cells[0].strip() and not cells[-1].strip():
+            cells = cells[1:-1]
+        elif not cells[0].strip():
+            cells = cells[1:]
+        elif not cells[-1].strip():
+            cells = cells[:-1]
+    return [c.strip() for c in cells]
+
+
+def _md_table_delimiter(line):
+    """Delimiter row → the column alignments, or None when the line is not one.
+
+    At least one `|` is required: a bare `---` is a horizontal rule (or a setext
+    underline), never a delimiter row.
+    """
+    if "|" not in line:
+        return None
+    cells = _md_split_row(line)
+    if not cells or not all(MD_TABLE_ALIGN_RE.match(c) for c in cells):
+        return None
+    aligns = []
+    for c in cells:
+        left = c.startswith(":")
+        right = c.endswith(":")
+        if left and right:
+            aligns.append(MD_TABLE_CENTER)
+        elif right:
+            aligns.append(MD_TABLE_RIGHT)
+        else:
+            aligns.append(MD_TABLE_LEFT)
+    return aligns
+
+
+def _md_is_table_row(line):
+    """True when a line can belong to a table block.
+
+    Either a delimiter row, or a paragraph line holding at least one unescaped pipe:
+    blank lines, fences, headings, rules, list markers and quotes belong to their own
+    blocks, so they end a table instead of extending it.
+    """
+    if not line.strip() or _fence_open(line) is not None:
+        return False
+    if _md_table_delimiter(line) is not None:
+        return True
+    return _md_block_kind(line) == MD_BLOCK_PARA and len(_md_split_row(line)) > 1
+
+
+# Screen width of a *rendered* string: WeeChat's color and attribute codes cost zero
+# columns, wide chars cost two, and the strikethrough overlay (U+0336) costs none — so
+# len() would misalign every styled cell. weechat.strlen_screen is authoritative; the
+# Python twin below covers contexts outside WeeChat (tests) and codes WeeChat did not
+# resolve ("" for unknown names).
+_STRLEN_SCREEN = getattr(weechat, "strlen_screen", None) if weechat is not None else None
+# WeeChat color codes: "\x19" + 2 (theme/base), 3 (palette, "F11") or 6 ("F@00236")
+# chars; attributes "\x1a" + 1; resets "\x1c" / "\x18". Probed on 4.10.1.
+_MD_CODE_RE = re.compile(r"\x19(?:F@\d{5}|F[0-9a-zA-Z]{2}|[0-9a-zA-Z]{2})|\x1a.|[\x18\x1c]")
+
+
+def _md_disp_width_py(text):
+    """Display columns without WeeChat: strip the codes, then measure by character."""
+    width = 0
+    for ch in _MD_CODE_RE.sub("", text):
+        if unicodedata.category(ch).startswith("M"):   # combining: zero width
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _md_disp_width(text):
+    """Display columns a rendered string occupies (WeeChat's own measure if available)."""
+    if _STRLEN_SCREEN is not None:
+        try:
+            return _STRLEN_SCREEN(text)
+        except Exception:
+            pass
+    return _md_disp_width_py(text)
 
 # Inline markdown: emphasis, code, strikethrough. Backslash escapes, and
 # markers that do not open a span stay literal.
@@ -659,6 +834,100 @@ def _md_inline(text, base="", pending=None, lookahead=None, strike=False):
     return "".join(out), None
 
 
+# The table grid. The frame is dim (the same no-color-on-purpose choice as the quote
+# bar) so the structure never competes with prose; header cells are bold in the message
+# color, body cells keep it. One rule under the header, none between rows.
+MD_TABLE_TOP = "\u250c"      # ┌
+MD_TABLE_JOINT = "\u252c"    # ┬
+MD_TABLE_RIGHT_TOP = "\u2510"   # ┐
+MD_TABLE_CROSS_L = "\u251c"  # ├ (not MD_TABLE_LEFT: that is the alignment name)
+MD_TABLE_CROSS = "\u253c"    # ┼
+MD_TABLE_RIGHT_MID = "\u2524"   # ┤
+MD_TABLE_BOTTOM = "\u2514"   # └
+MD_TABLE_JOINT_B = "\u2534"  # ┴
+MD_TABLE_RIGHT_BOT = "\u2518"   # ┘
+MD_TABLE_V = "\u2502"        # │
+MD_TABLE_H = "\u2500"        # ─
+MD_TABLE_STYLE = MD_QUOTE_STYLE
+MD_TABLE_CELL_PAD = 1        # one space each side of a cell, inside the frame
+
+
+def _md_table_rule(widths, left, joint, right):
+    """One horizontal frame line: `─` per column, joined by the corner glyphs."""
+    return left + joint.join(MD_TABLE_H * (w + 2 * MD_TABLE_CELL_PAD)
+                             for w in widths) + right
+
+
+def _md_table_cell(body, measured, width, align):
+    """Pad one already-rendered cell to `width` columns, between two spaces.
+
+    `measured` is the cell's display width without its trailing reset (that code costs
+    nothing on screen, and counting it would make the padding depend on who measures).
+    The padding sits after the reset, so no attribute or background bleeds into the gap,
+    and a `**bold**` cell reserves only the columns it actually displays.
+    """
+    fill = max(0, width - measured)
+    if align == MD_TABLE_RIGHT:
+        body = " " * fill + body
+    elif align == MD_TABLE_CENTER:
+        left = fill // 2
+        body = " " * left + body + " " * (fill - left)
+    else:
+        body = body + " " * fill
+    return " " + body + " "
+
+
+def _md_render_table(lines, cell_base=None):
+    """A complete table block → box-drawing grid lines, or None if it is not one.
+
+    The widths come from every cell, so this can only run once the block is finished.
+    Ragged rows are padded or truncated to the header's column count, and cells render
+    through _md_inline (never through the print path), so styled text costs exactly the
+    columns it displays.
+    """
+    if len(lines) < 2:
+        return None
+    aligns = _md_table_delimiter(lines[1])
+    if not aligns:
+        return None
+    header = _md_split_row(lines[0])
+    cols = len(header)
+    if not cols:
+        return None
+    rows = [header]
+    for line in lines[2:]:
+        row = _md_split_row(line)
+        rows.append((row + [""] * cols)[:cols])   # ragged rows follow the header
+    # cells are rendered first (the header is bold, the body is not), then measured:
+    # a column reserves exactly the widest cell as it will be displayed
+    prepared = []
+    cell_base = C_PI if cell_base is None else cell_base
+    head_base = cell_base + A_BOLD
+    for idx, row in enumerate(rows):
+        base = head_base if idx == 0 else cell_base
+        cells = []
+        for text in row:
+            rendered, _open = _md_inline(text, base)
+            styled = base + rendered
+            cells.append((styled + R, _md_disp_width(styled)))
+        prepared.append(cells)
+    widths = [max([cells[i][1] for cells in prepared] + [1]) for i in range(cols)]
+    bar = MD_TABLE_STYLE + MD_TABLE_V + R   # the dim separator at every column boundary
+    out = [MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_TOP, MD_TABLE_JOINT,
+                                           MD_TABLE_RIGHT_TOP) + R]
+    for idx, cells in enumerate(prepared):
+        line = [_md_table_cell(body, measured, widths[i],
+                               aligns[i] if i < len(aligns) else MD_TABLE_LEFT)
+                for i, (body, measured) in enumerate(cells)]
+        out.append(bar + bar.join(line) + bar + R)
+        if idx == 0:
+            out.append(MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_CROSS_L,
+                                                       MD_TABLE_CROSS,
+                                                       MD_TABLE_RIGHT_MID) + R)
+    out.append(MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_BOTTOM,
+                                               MD_TABLE_JOINT_B, MD_TABLE_RIGHT_BOT) + R)
+    return out
+
 # Per-tool summary of tool_start args: the "main content" of each tool's
 # argument struct, in display order (see format_tool_args).
 TOOL_ARG_KEYS = {
@@ -763,10 +1032,17 @@ PLUGIN_OPTIONS = (
      'Render pi’s markdown replies (headings, bold/italic, inline code, lists, '
      'blockquotes, rules) with WeeChat color and attribute codes: on | off. '
      'Blocks are printed when complete, so a paragraph appears at its blank line.'),
+    ("auto_clean", AUTO_CLEAN_DEFAULT_HOURS,
+     'Hours a pi buffer whose pi connection is gone may print nothing before '
+     'auto-clean closes it (default 24; 0 = never close; fractional hours '
+     'accepted). A buffer shown in a window is skipped, and so is one with '
+     'text on its input line. These buffers are not logged, so a closed '
+     'buffer is gone for good. Swept once an hour and on /set.'),
 )
 
 HELP_TEXT = (
-    "!s <text> steer current turn · !q <text> queue follow-up\n"
+    "plain text → pi (steer current turn; starts a new turn if idle)\n"
+    "!q <text> queue a follow-up message for after the current turn\n"
     "!new new session · !compact compact context · !abort abort current turn\n"
     "!cd <path> switch pi to a project dir (fuzzy match → pick list)\n"
     "!pick <n|text> answer pi’s “?” prompt (!pick cancel aborts)\n"
@@ -775,8 +1051,7 @@ HELP_TEXT = (
     "!think [on|off] show/hide thinking lines (default: off)\n"
     "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
     "!nick [auto|pi] nick column: tool names vs just “pi” (default: auto)\n"
-    "!markdown [on|off] render pi's markdown replies (default: on)\n"
-    "anything else is sent to pi as a normal message"
+    "!markdown [on|off] render pi's markdown, tables as grids (default: on)\n"
 )
 
 
@@ -891,6 +1166,37 @@ def _fmt_elapsed(secs):
     h, m = s // 3600, (s % 3600) // 60
     return ("%dh%dm" % (h, m)) if m else ("%dh" % h)
 
+def _last_line_date(buf):
+    """Epoch date of the newest dated line in `buf`, or None when it has none.
+
+    `buffer_lines` walks oldest to newest, so `infolist_prev` reaches the
+    newest line first. `infolist_time(…, "date")` is epoch seconds on modern
+    WeeChat; lines WeeChat stamps with date 0 (internal lines) are skipped.
+    """
+    infolist = weechat.infolist_get("buffer_lines", buf, "")
+    if not infolist:
+        return None
+    date = None
+    while weechat.infolist_prev(infolist):
+        d = weechat.infolist_time(infolist, "date")
+        if isinstance(d, str):      # WeeChat < 2.2 returned a string
+            d = 0
+        if d:
+            date = d
+            break
+    weechat.infolist_free(infolist)
+    return date
+
+
+def _line_age(now, date):
+    """Age in seconds of a line date, or None when the date is unusable."""
+    if not date or date <= 0:
+        return None
+    if date > 10_000_000_000:       # a future WeeChat reporting milliseconds
+        date //= 1000
+    if date > now:                  # clock jumped forward: treat as just written
+        return 0.0
+    return now - date
 class Session(object):
     """One pi session: a persistent buffer/controller with a replaceable
     connection.
@@ -925,6 +1231,7 @@ class Session(object):
         self._md_block = []           # raw lines of the block being built
         self._md_block_type = None    # MD_BLOCK_* while a block is open
         self._md_block_mode = True    # pi_bridge.markdown state when it started
+        self._md_block_bytes = 0      # size of the pending block (table caps, see above)
         self._md_blank_owed = False   # blank separator owed before the NEXT block
         self._md_printing = False     # inside a flush: never flush recursively
         # pending interactive prompt from pi (ui_request); answered via !pick
@@ -1196,6 +1503,43 @@ class Session(object):
             self._print_msg(C_PI + text + R, "pi")
             return
 
+        # A table is only recognisable once its delimiter row arrives, so a one-line
+        # header candidate stays pending and every further line is re-examined until the
+        # construct settles. Nothing prints while it is pending, so relabelling the block
+        # is safe: the header was never rendered as prose.
+        while True:
+            if self._md_block_type == MD_BLOCK_TABLE:
+                if _md_is_table_row(text):
+                    self._md_append_table_row(text)
+                    return
+                self._flush_md_block()   # the table ended; re-handle this line
+            elif (self._md_block_type == MD_BLOCK_PARA and len(self._md_block) == 1 and
+                  _md_table_delimiter(text) is not None):
+                self._md_block_type = MD_BLOCK_TABLE
+                self._md_block.append(text)
+                self._md_block_bytes += len(text)
+                return
+            break
+        self._md_handle_block_line(text)
+
+    def _md_append_table_row(self, text):
+        """Extend an open table block, degrading to plain text past the caps.
+
+        A table is buffered until it ends (the column widths need every cell), so a
+        runaway one must not hold the buffer hostage: past either cap the block is
+        printed exactly as pi wrote it, and the rows that follow keep that plain mode.
+        """
+        if (len(self._md_block) + 1 > MD_TABLE_MAX_ROWS or
+                self._md_block_bytes + len(text) + 1 > MD_TABLE_MAX_BYTES):
+            self._md_block_mode = False       # the rows as pi wrote them, not a grid
+            self._flush_md_block()            # ... of a table nobody asked for
+            self._md_start_block(MD_BLOCK_TABLE, text, mode=False)  # the rest, as text
+            return
+        self._md_block.append(text)
+        self._md_block_bytes += len(text) + 1
+
+    def _md_handle_block_line(self, text):
+        """Route one assistant line into the block being built (no table in progress)."""
         setext = _md_setext_level(text)
         if setext and self._md_block_type == MD_BLOCK_PARA:
             self._md_block.append(text)
@@ -1250,15 +1594,17 @@ class Session(object):
             body = text
         self._print_msg("  " + body, "pi")
 
-    def _md_start_block(self, kind, text):
+    def _md_start_block(self, kind, text, mode=None):
         self._md_block_type = kind
-        self._md_block_mode = self.markdown_enabled()
+        self._md_block_mode = self.markdown_enabled() if mode is None else mode
         self._md_block = [text]
+        self._md_block_bytes = len(text)
 
     def _md_block_done(self):
         """Forget the pending block (it has just been flushed)."""
         self._md_block = []
         self._md_block_type = None
+        self._md_block_bytes = 0
 
     def _flush_md_block(self):
         """Print the pending block. Idempotent, and never re-entrant.
@@ -1319,6 +1665,12 @@ class Session(object):
                 rendered, pending = _md_inline(content, C_PI, pending, rest)
                 out.append(prefix + C_PI + rendered + R)
             return out
+        if kind == MD_BLOCK_TABLE:
+            # classified as one by the streaming state machine; None means the block
+            # never got a real delimiter row, so it prints as prose
+            grid = _md_render_table(lines)
+            if grid is not None:
+                return grid
         return self._render_styled(lines, C_PI)
 
     def _render_quote(self, lines):
@@ -1347,13 +1699,48 @@ class Session(object):
                 body.append((depth, inner))
         while body and not body[-1][1]:
             body.pop()
+        # A table inside a quote keeps its grid: consecutive quoted rows that begin
+        # with a header row plus a delimiter row become one table run.
+        segments = []
+        i = 0
+        while i < len(body):
+            level, text = body[i]
+            if (_md_is_table_row(text) and i + 1 < len(body) and
+                    _md_table_delimiter(body[i + 1][1]) is not None):
+                rows = [text]
+                j = i + 1
+                while j < len(body) and _md_is_table_row(body[j][1]):
+                    rows.append(body[j][1])
+                    j += 1
+                if (len(rows) > MD_TABLE_MAX_ROWS or
+                        sum(len(r) + 1 for r in rows) > MD_TABLE_MAX_BYTES):
+                    # the same degradation the streaming machine applies to a top-level
+                    # table: past the caps, print the rows as they arrived
+                    segments.extend(body[i:j])
+                    i = j
+                    continue
+                grid = _md_render_table(rows, MD_QUOTE_STYLE)
+                if grid is not None:
+                    segments.append((level, grid))
+                    i = j
+                    continue
+            segments.append((level, text))
+            i += 1
         out = []
         pending = None
-        texts = [t for _, t in body]
-        for idx, (level, text) in enumerate(body):
-            rest = "\n".join(texts[idx + 1:]) if idx + 1 < len(texts) else None
-            rendered, pending = _md_inline(text, MD_QUOTE_STYLE, pending, rest)
-            if not text:
+        texts = [s[1] for s in segments if type(s[1]) is str]
+        seen = 0
+        for level, payload in segments:
+            if type(payload) is not str:
+                # a grid interrupts an emphasis span carried across lines
+                pending = None
+                for line in payload:
+                    out.append(MD_QUOTE_BAR * level + line)
+                continue
+            rest = "\n".join(texts[seen + 1:]) if seen + 1 < len(texts) else None
+            seen += 1
+            rendered, pending = _md_inline(payload, MD_QUOTE_STYLE, pending, rest)
+            if not payload:
                 out.append("")           # blank between quoted paragraphs
             else:
                 out.append(MD_QUOTE_BAR * level + MD_QUOTE_STYLE + rendered + R)
@@ -1526,6 +1913,9 @@ class Session(object):
         `input` asks for free-form text. Only one prompt is tracked at a
         time — a new request supersedes the old one, which is released on
         the pi side with a cancelled ui_response so it doesn't wait forever.
+        The "?" title line is tagged notify_highlight (like the ready
+        banner) — it needs the user's attention, so it pings even when
+        the buffer is not visible. The option/hint lines stay quiet.
         """
         req_id = msg.get("id")
         method = msg.get("method")
@@ -1550,7 +1940,12 @@ class Session(object):
             multiple = bool(msg.get("multiple"))
             self.pending_ui = {"id": req_id, "method": "select",
                                "options": options, "multiple": multiple}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                # notify_highlight (like the ready banner): the user must
+                # act (!pick), so an off-screen buffer pings
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             for i, (label, desc) in enumerate(options, 1):
                 self._print("%2d. %s" % (i, label))
                 if desc:
@@ -1560,7 +1955,10 @@ class Session(object):
             self._print(C_DIM + hint + R)
         else:  # input
             self.pending_ui = {"id": req_id, "method": "input"}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             placeholder = msg.get("placeholder")
             ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
             self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)
@@ -1648,7 +2046,7 @@ class Session(object):
     def _send_user_input(self, text, echo, msg):
         """Forward one buffer line to pi as user_input (rate-limited).
 
-        `text` is what goes on the wire (prefixes like "!s " stripped),
+        `text` is what goes on the wire (prefixes like "!q " stripped),
         `echo` is what gets echoed into the buffer (the line as typed).
 
         This is the only path that spends the remote pi's LLM budget, so it
@@ -1774,12 +2172,12 @@ class Session(object):
         elif line == "!pick" or line.startswith("!pick "):
             self.handle_pick(line[5:].strip(), line)
             return
-        elif line.startswith("!s "):
-            self._send_user_input(line[3:], line, {"deliverAs": "steer"})
         elif line.startswith("!q "):
             self._send_user_input(line[3:], line, {"deliverAs": "followUp"})
         else:
-            self._send_user_input(line, line, {})
+            # Plain text steers the running turn; when pi is idle the
+            # deliverAs is ignored and a new turn simply starts.
+            self._send_user_input(line, line, {"deliverAs": "steer"})
 
     def _reset_transient(self):
         """Forget per-connection rendering state: a (re)connect starts fresh
@@ -1798,11 +2196,58 @@ class Session(object):
         # will send a fresh Pi-owned snapshot after the next handshake.
         self.timing_snapshot = None
         self.timing_received_at = None
-    def handle_disconnect(self):
-        """The connection went away; the buffer stays open."""
+    # ------------------------------------------------- join / quit lifecycle
+    LIFECYCLE_NICK = "pi"     # the nick a lifecycle line reports
+
+    def channel_name(self):
+        """`#` + this buffer's name: the channel a lifecycle line names."""
+        name = ""
+        if self.alive and self.buffer:
+            try:
+                name = weechat.buffer_get_string(self.buffer, "name") or ""
+            except Exception:
+                name = ""
+        return "#%s" % (name or "pi")
+
+    def _print_lifecycle(self, kind, ip=None, reason=None):
+        """Print one join or quit line, shaped like the IRC plugin's own.
+
+        WeeChat's join/quit prefix (`-->\t`, `<--\t`) rides in front of the body,
+        so the line takes the prefix column instead of the nick column. The body
+        reads `pi (~pi@10.0.0.2) has joined #pi:~/src/project`: nick in the
+        join/quit color, hostmask in chat_host, channel in chat_channel. The tags
+        mirror the IRC plugin (`irc_join` / `irc_quit`, `nick_<nick>`,
+        `host_<nick>@<host>`) so filters see a real join, minus
+        `irc_smart_filter`, which would let WeeChat fold these lines away.
+        `notify_none` keeps them quiet: the turn-settle `[x] ready!` banner stays
+        the only notification. Nothing prints while the script unloads — those
+        buffers are on their way out.
+        """
+        if self.bridge.unloading or not (self.alive and self.buffer):
+            return
+        who = self.LIFECYCLE_NICK
+        host = ip or "localhost"          # a unix socket has no address
+        mask = "~%s@%s" % (who, host)
+        if kind == "join":
+            tag, color = "irc_join", C_JOIN
+            body = (color + who + C_DIM + " (%s)" % mask
+                    + color + " has joined " + C_CHAN + self.channel_name())
+        else:
+            tag, color = "irc_quit", C_QUIT
+            body = (color + who + C_DIM + " (%s)" % mask + color
+                    + " has quit " + C_QUIT_REASON
+                    + "(" + (reason or QUIT_REASONS["peer"]) + ")")
+        weechat.prnt_date_tags(
+            self.buffer, int(time.time()),
+            "%s,nick_%s,host_%s@%s,notify_none" % (tag, who, who, host),
+            _lifecycle_prefix(kind) + body)
+
+    def handle_disconnect(self, conn=None, reason="peer"):
+        """The connection went away; the buffer stays open and the nick quits."""
         self._reset_transient()
         self.set_state("waiting")
-        self._print(C_DIM + "— pi disconnected —%s" % R)
+        self._print_lifecycle("quit", (conn or {}).get("ip"),
+                              QUIT_REASONS.get(reason, QUIT_REASONS["peer"]))
     def handle_reattach(self):
         """A reconnecting session reattaches to this buffer (history kept).
         "Stale per-connection state is flushed; if the user closed the
@@ -1824,6 +2269,7 @@ class Session(object):
 
 class Bridge(object):
     def __init__(self):
+        self.unloading = False      # cleanup() sets it: quit lines stop printing
         self.sock_path = default_socket_path()
         # unix listener (always on)
         self.listen_sock = None
@@ -1848,6 +2294,8 @@ class Bridge(object):
         self.ip_failures = {}         # ip -> [timestamps of auth failures]
         self.ip_lockouts = {}         # ip -> lockout-until (epoch)
         self.tick_hook = None         # 1s hook_timer handle (live counters)
+        self.auto_clean_hook = None   # hourly sweep (pi_bridge.auto_clean)
+        self._sweeping = False        # re-entrancy guard for the sweep
 
     # ------------------------------------------------------- connection state
 
@@ -1952,6 +2400,98 @@ class Bridge(object):
         for session in self.sessions:
             session._print(text)
 
+    # ------------------------------------------------ idle-buffer auto-clean
+
+    def _auto_clean_hours(self):
+        """pi_bridge.auto_clean as float hours; 0.0 means cleanup is off.
+
+        Empty, unparseable, zero, or negative all mean "never close".
+        """
+        try:
+            hours = float(self._opt("auto_clean"))
+        except ValueError:
+            return 0.0
+        return hours if hours > 0 else 0.0
+
+    def _drop_session(self, session):
+        """Remove a Session from every registry, by object identity.
+
+        Nothing here may look a closed buffer pointer up again: after
+        buffer_close() it can already belong to a newer buffer.
+        """
+        try:
+            self.sessions.remove(session)
+        except ValueError:
+            pass
+        self.session_by_buffer = {b: s for b, s in self.session_by_buffer.items()
+                                  if s is not session}
+        self.session_by_id = {i: s for i, s in self.session_by_id.items()
+                              if s is not session}
+        session.pending_ui = None
+        session.tool_nicks = {}
+        session.timing_snapshot = None
+        session.timing_received_at = None
+
+    def sweep_idle_sessions(self):
+        """Close buffers whose pi connection is gone and that printed nothing
+        for pi_bridge.auto_clean hours, then drop their Sessions.
+
+        Returns the number of buffers closed. Called by the hourly timer and
+        by pi_config_cb, both on WeeChat's main thread. It only ever walks
+        Bridge.sessions, so it can never close a buffer the bridge does not own.
+        """
+        if self._sweeping:
+            return 0        # a timer sweep and a /set sweep never overlap
+        hours = self._auto_clean_hours()
+        if not hours:
+            return 0        # auto_clean 0 or garbage: keep every buffer
+        limit = hours * 3600.0
+        closed = 0
+        self._sweeping = True
+        try:
+            for session in list(self.sessions):
+                if session.conn is not None:
+                    continue    # a live pi session keeps its buffer, however quiet
+                buffer = session.buffer if session.alive else None
+                if not buffer:
+                    # No connection and no buffer: it can never render again and
+                    # its lines are already gone (these buffers set no_log).
+                    self._drop_session(session)
+                    continue
+                name = weechat.buffer_get_string(buffer, "name") or "?"
+                age = _line_age(time.time(), _last_line_date(buffer))
+                if age is None or age < limit:
+                    continue    # nothing dated, or young enough to keep
+                if (weechat.buffer_get_string(buffer, "first_window")
+                        or buffer == weechat.current_buffer()):
+                    weechat.prnt("", C_DIM + "pi bridge: %s idle %s but shown "
+                                 "in a window — close the window (/window "
+                                 "merge) to let auto-clean close it%s"
+                                 % (name, _fmt_elapsed(age), R))
+                    continue
+                if weechat.buffer_get_string(buffer, "input"):
+                    continue    # someone is mid-line in that buffer
+                # buffer_close() runs pi_close_cb inside the call, which pops
+                # the buffer map and clears session.buffer/alive. The pointer is
+                # dead when it returns: nothing below may use it again.
+                rc = weechat.buffer_close(buffer)
+                if not rc:
+                    weechat.prnt("", C_ERR + "pi bridge: could not close idle "
+                                 "buffer %s; the next sweep will retry%s"
+                                 % (name, R))
+                    continue
+                # Belt and braces: should the close callback ever fail to run,
+                # the Session must not keep a pointer WeeChat has freed.
+                session.buffer = None
+                session.alive = False
+                self._drop_session(session)
+                closed += 1
+                weechat.prnt("", C_STATUS + "pi bridge: closed idle buffer %s "
+                             "(idle %s)%s" % (name, _fmt_elapsed(age), R))
+        finally:
+            self._sweeping = False
+        return closed
+
     # ------------------------------------------------------------ listeners
 
     def make_unix_server(self):
@@ -2022,10 +2562,10 @@ class Bridge(object):
         if not keep_conns:
             for conn in list(self.pending):
                 if conn.get("ip") is not None:
-                    self.drop_conn(conn)
+                    self.drop_conn(conn, "bridge")
             for conn in list(self.clients):
                 if conn.get("ip") is not None:
-                    self.drop_conn(conn)
+                    self.drop_conn(conn, "bridge")
 
     # --------------------------------------------------------------- accept
 
@@ -2151,7 +2691,7 @@ class Bridge(object):
                 break
             except OSError as err:
                 dbg("recv error: %s" % err)
-                self.drop_conn(conn)
+                self.drop_conn(conn, "error")
                 return
             if not chunk:  # peer closed (recv == 0) → disconnect
                 dbg("recv 0 bytes — %s closed, dropping" % conn["peer"])
@@ -2263,13 +2803,27 @@ class Bridge(object):
         if session is None:
             if self.load_session.conn is None:
                 session = self.load_session  # first client takes the load-time buffer
+                if session not in self.sessions:
+                    # the sweep drops a Session that owns no buffer and no
+                    # connection; taking it again puts it back in the list
+                    self.sessions.append(session)
             else:
                 session = Session(self)
                 self.sessions.append(session)
                 session.make_buffer(self.session_name_for(session))
         conn["session"] = session
         session.conn = conn
+        # A Session must own a buffer before anything renders on it: the
+        # load-time Session may have lost its buffer to auto-clean or to a
+        # manual /buffer close, and a new Session's make_buffer may have
+        # failed. handle_reattach() covers a reattach; this covers every path.
+        if not (session.alive and session.buffer):
+            session.make_buffer(self.session_name_for(session))
         if session_id:
+            if session.session_id and session.session_id != session_id:
+                # release the old mapping only if it still points here
+                if self.session_by_id.get(session.session_id) is session:
+                    del self.session_by_id[session.session_id]
             session.session_id = session_id
             self.session_by_id[session_id] = session
         self.clients.append(conn)
@@ -2278,10 +2832,7 @@ class Bridge(object):
         self._send_to(conn, {"type": "hello", "protocol": PROTOCOL,
                              "name": "weechat-pi-bridge"})
         session.set_state("idle")
-        if conn["ip"] is not None:
-            session._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
-        else:
-            session._print(C_OK + "— pi connected —%s" % R)
+        session._print_lifecycle("join", conn["ip"])
         dbg("client authed: %s (session_id=%s, reattach=%s)"
             % (conn["peer"], session_id or "-", reattach))
 
@@ -2293,7 +2844,12 @@ class Bridge(object):
         dbg("auth timeout: dropping %s" % conn["peer"])
         self.drop_conn(conn)
 
-    def drop_conn(self, conn):
+    def drop_conn(self, conn, reason="peer"):
+        """Close a connection and let its session print the matching quit line.
+
+        `reason` keys QUIT_REASONS and says who closed the socket. A connection
+        that never authenticated owns no session, so it prints nothing.
+        """
         dbg("drop_conn %s (authed=%s)" % (conn.get("peer"), conn.get("authed")))
         self._unhook_timer(conn)
         self._close_sock(conn["sock"])
@@ -2309,7 +2865,7 @@ class Bridge(object):
         if session is not None:
             session.conn = None
             conn["session"] = None
-            session.handle_disconnect()
+            session.handle_disconnect(conn, reason)
 
     def _unhook_timer(self, conn):
         if conn.get("timer"):
@@ -2352,7 +2908,7 @@ class Bridge(object):
                 return
             except OSError as err:
                 dbg("flush: send error %s — dropping client" % err)
-                self.drop_conn(conn)
+                self.drop_conn(conn, "error")
                 return
             conn["outq"] = conn["outq"][n:]
         if conn["write_hook"]:
@@ -2369,11 +2925,12 @@ class Bridge(object):
     # -------------------------------------------------------------- cleanup
 
     def cleanup(self):
+        self.unloading = True   # the buffers leave with the script: print no quit lines
         self.stop_tcp_server()
         for conn in list(self.pending):
-            self.drop_conn(conn)
+            self.drop_conn(conn, "bridge")
         for conn in list(self.clients):
-            self.drop_conn(conn)
+            self.drop_conn(conn, "bridge")
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
@@ -2392,6 +2949,9 @@ class Bridge(object):
         if self.tick_hook:
             weechat.unhook(self.tick_hook)
             self.tick_hook = None
+        if self.auto_clean_hook:
+            weechat.unhook(self.auto_clean_hook)
+            self.auto_clean_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -2459,12 +3019,14 @@ def pi_input_cb(data, buffer, line):
 
 def pi_close_cb(data, buffer):
     session = BRIDGE.session_by_buffer.pop(buffer, None)
-    if session is not None:
-        session.alive = False
-        # drop the native buffer pointer: WeeChat frees the buffer once
-        # this callback returns, so any later buffer_* call with it is a
-        # use-after-free (native crash, not catchable in Python).
+    if session is not None and session.buffer == buffer:
+        # Drop the native buffer pointer: WeeChat frees the buffer once this
+        # callback returns, so any later buffer_* call with it is a
+        # use-after-free (native crash, not catchable in Python). The guard
+        # keeps a duplicate callback for an old pointer from clearing a
+        # buffer the session recreated in the meantime.
         session.buffer = None
+        session.alive = False
     return weechat.WEECHAT_RC_OK
 
 
@@ -2498,12 +3060,18 @@ def pi_tick_cb(data, *args):
         session.tick()
     return weechat.WEECHAT_RC_OK
 
+def pi_auto_clean_cb(data, *args):
+    """Hourly timer: close idle buffers whose pi connection is gone."""
+    BRIDGE.sweep_idle_sessions()
+    return weechat.WEECHAT_RC_OK
+
 
 def pi_config_cb(data, option, *args):
     """Fired on any plugins.var.python.pi_bridge.* option change.
 
     tcp_listen changes rebind the listener live (urlserver.py pattern);
-    token/allowed_ips need no restart — they apply per connection/accept.
+    token/allowed_ips need no restart — they apply per connection/accept;
+    auto_clean runs the idle-buffer sweep at once.
     """
     name = option.rsplit(".", 1)[-1] if option else ""
     if name == "tcp_listen":
@@ -2524,6 +3092,23 @@ def pi_config_cb(data, option, *args):
         # built under the old one, so print it before the switch takes effect
         for session in BRIDGE.sessions:
             session._flush_md_block()
+    if name == "auto_clean":
+        # The feedback rides on the core buffer: printing it into a pi buffer
+        # would stamp a fresh line there and reset the idle age being set.
+        raw = BRIDGE._opt("auto_clean")
+        try:
+            hours = float(raw) if raw else 0.0
+        except ValueError:
+            weechat.prnt("", C_REJECT + "pi bridge: auto_clean %r is not a "
+                         "number of hours — auto-clean is off%s" % (raw, R))
+        else:
+            if hours > 0:
+                weechat.prnt("", C_STATUS + "pi bridge: auto_clean = %g h%s"
+                             % (hours, R))
+            else:
+                weechat.prnt("", C_STATUS + "pi bridge: auto_clean off — pi "
+                             "buffers are kept%s" % R)
+        BRIDGE.sweep_idle_sessions()   # immediate effect, no reload needed
     if name in ("tcp_listen", "token"):
         BRIDGE.config_warnings()
     return weechat.WEECHAT_RC_OK
@@ -2555,7 +3140,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.7.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.8.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options: PLUGIN_OPTIONS = (name, default, description).
@@ -2570,6 +3155,10 @@ def main():
     BRIDGE.make_buffer()
     # 1s tick timer: refresh the buffer-title turn counter while a request runs
     BRIDGE.tick_hook = weechat.hook_timer(1000, 0, 0, "pi_tick_cb", "")
+    # hourly sweep: close a buffer whose pi connection is gone and that printed
+    # nothing for pi_bridge.auto_clean hours (0 disables auto-clean entirely)
+    BRIDGE.auto_clean_hook = weechat.hook_timer(AUTO_CLEAN_SWEEP_S * 1000, 0, 0,
+                                                "pi_auto_clean_cb", "")
     try:
         BRIDGE.make_unix_server()
     except OSError as err:

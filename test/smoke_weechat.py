@@ -15,11 +15,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import select
 import socket
 import sys
 import tempfile
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "weechat", "pi_bridge.py")
@@ -27,6 +29,13 @@ SCRIPT = os.path.join(HERE, "..", "weechat", "pi_bridge.py")
 # ---------------------------------------------------------------- weechat stub
 
 WEECHAT_RC_OK = 3
+
+_STUB_CODE_RE = re.compile(r"\x19(?:F@\d{5}|F[0-9a-zA-Z]{2}|[0-9a-zA-Z]{2})|\x1a.|[\x18\x1c]")
+
+
+def _stub_visible(text):
+    """The bridge's color/attribute codes, as a terminal would drop them."""
+    return _STUB_CODE_RE.sub("", text)
 
 
 class WeechatStub:
@@ -53,6 +62,13 @@ class WeechatStub:
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
         self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
         self.localvars = {}       # buffer localvars (localvar_set_*)
+        self.buf_lines = {}       # buffer pointer -> [[date, text]], oldest first
+        self.buf_close_cbs = {}   # buffer pointer -> close callback name
+        self.buf_displayed = set()  # buffers treated as "shown in a window"
+        self.buf_input = {}       # buffer pointer -> text on its input line
+        self.current_buf = None   # what current_buffer() answers
+        self.infolists = {}       # infolist handle -> {lines, pos, cur}
+        self._infolist_seq = 0
 
     # -- colors / plugin options -----------------------------------------
     def color(self, name):
@@ -62,13 +78,24 @@ class WeechatStub:
         return {"white": "W", "magenta": "M", "cyan": "C", "blue": "B",
                 "yellow": "E", "green": "G", "red": "r", "236": "D",
                 # syntax-highlight palette (HL_TOKENS) + reset marker
-                "reset": "0", "bold magenta": "K", "darkgray": "d",
-                "lightblue": "L", "lightgreen": "g",
+                "reset": "\x1c", "bold magenta": "K", "darkgray": "d",
+                "lightblue": "L", "lightgreen": "g", "lightred": "R",
                 # text attributes: exactly the codes real WeeChat 4.10.1
                 # returns (probed), which the TUI and relay clients decode
                 "bold": "\x1a\x01", "italic": "\x1a\x03",
                 "underline": "\x1a\x04", "reverse": "\x1a\x02",
                 "dim": "\x1a\x06"}.get(name, "")
+
+    def strlen_screen(self, text):
+        """Emulate weechat.strlen_screen(): codes cost no columns, wide chars two.
+
+        The bridge uses this for table column widths when WeeChat provides it, so the
+        stub has to behave like the real binding rather than len().
+        """
+        stripped = _stub_visible(text)
+        return sum(0 if unicodedata.combining(c) else
+                   2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in stripped)
 
     def config_is_set_plugin(self, name):
         return name in self.plugin_opts
@@ -124,6 +151,8 @@ class WeechatStub:
         self.buffer_name = name
         self.buf_names[buf] = name
         self.buf_prints[buf] = []
+        self.buf_lines[buf] = []
+        self.buf_close_cbs[buf] = close_cb
         self.input_cb_name = input_cb
         return buf
 
@@ -141,9 +170,18 @@ class WeechatStub:
         return 1
 
     def buffer_close(self, buf):
+        # Real WeeChat fires the buffer's own close callback INSIDE this call
+        # and frees the buffer when it returns: every later buffer_*/prnt*
+        # with that pointer is a use-after-free, which _note_stale records.
+        cb = self.buf_close_cbs.pop(buf, None)
+        if cb:
+            self.ns[cb]("", buf)
         self.closed_bufs.add(buf)
         self.buf_names.pop(buf, None)
         self.buf_prints.pop(buf, None)
+        self.buf_lines.pop(buf, None)
+        self.buf_displayed.discard(buf)
+        self.buf_input.pop(buf, None)
         return 1
 
     def _note_stale(self, func, buf, prop):
@@ -161,12 +199,17 @@ class WeechatStub:
             return ""
         if prop in ("name", "short_name"):
             return self.buf_names.get(buf, "")
+        if prop == "input":
+            return self.buf_input.get(buf, "")
+        if prop == "first_window":
+            return "window1" if buf in self.buf_displayed else ""
         return ""
 
     def prnt(self, buf, msg):
         self._note_stale("prnt", buf, None)
         self.prints.append(("PRINT", msg))
         self.buf_prints.setdefault(buf, []).append(msg)
+        self.buf_lines.setdefault(buf, []).append([time.time(), msg])
 
     def prnt_date_tags(self, buf, date, tags, message):
         self._note_stale("prnt_date_tags", buf, None)
@@ -178,8 +221,75 @@ class WeechatStub:
             prefix, body = "", message
         self.prints.append(("PRINTF", body))
         self.buf_prints.setdefault(buf, []).append(message)
+        # date 0 means "now", like the real API
+        self.buf_lines.setdefault(buf, []).append([date or time.time(), message])
         self.printf_tags.append((tags, prefix, body))
         return 1
+
+    # -- buffer_lines infolist (auto-clean reads the newest line's date) --
+    def infolist_get(self, name, target, args):
+        self._note_stale("infolist_get", target, name)
+        if name != "buffer_lines":
+            return None
+        self._infolist_seq += 1
+        handle = "infolist-%d" % self._infolist_seq
+        # Like the real API: the lines are copied out, so a print that happens
+        # after infolist_get does not move this handle's cursor.
+        self.infolists[handle] = {"lines": [list(row) for row
+                                            in self.buf_lines.get(target, [])],
+                                  "pos": None, "cur": None}
+        return handle
+
+    def infolist_prev(self, infolist):
+        # WeeChat starts positioned before the first entry, so the first
+        # prev() lands on the newest line.
+        info = self.infolists.get(infolist)
+        if not info or not info["lines"]:
+            return 0
+        if info["pos"] is None:
+            info["pos"] = len(info["lines"]) - 1
+        elif info["pos"] > 0:
+            info["pos"] -= 1
+        else:
+            return 0
+        info["cur"] = info["lines"][info["pos"]]
+        return 1
+
+    def infolist_time(self, infolist, key):
+        info = self.infolists.get(infolist)
+        if not info or info["cur"] is None or key != "date":
+            return 0
+        return info["cur"][0]
+
+    def infolist_free(self, infolist):
+        self.infolists.pop(infolist, None)
+        return 1
+
+    # -- test knobs: windows, input line, line dates ----------------------
+    def show_in_window(self, buf):
+        self.buf_displayed.add(buf)
+
+    def hide_from_window(self, buf):
+        self.buf_displayed.discard(buf)
+
+    def set_input_line(self, buf, text):
+        self.buf_input[buf] = text
+
+    def current_buffer(self):
+        return self.current_buf
+
+    def age_buffer(self, buf, seconds):
+        """Move every stored line of `buf` `seconds` into the past."""
+        for row in self.buf_lines.get(buf, []):
+            row[0] -= seconds
+
+    def newest_line_date(self, buf):
+        rows = self.buf_lines.get(buf, [])
+        return rows[-1][0] if rows else None
+
+    def reset_stale_calls(self):
+        """Forget recorded use-after-free calls, for per-phase assertions."""
+        self.stale_calls = []
 
     # -- hooks -----------------------------------------------------------
     def hook_fd(self, fd, fr, fw, fe, cb, data):
@@ -361,9 +471,13 @@ def main():
     assert stub.plugin_opts.get("token") == "", "token defaults empty"
     assert stub.plugin_opts.get("allowed_ips") == "", "allowed_ips defaults empty"
     assert stub.plugin_opts.get("tool_output") == "summary", "tool_output defaults summary"
+    assert stub.plugin_opts.get("auto_clean") == ns["AUTO_CLEAN_DEFAULT_HOURS"] == "24", \
+        "auto_clean defaults to 24 hours (cleanup on)"
+    assert any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), \
+        "main() hooks the hourly auto-clean sweep"
     # help descriptions registered for every plugin option (/help set …)
     for name in ("tcp_listen", "token", "allowed_ips",
-                "tool_output", "thinking", "highlight"):
+                "tool_output", "thinking", "highlight", "auto_clean"):
         assert name in stub.plugin_descs, "missing description for %s" % name
         assert stub.plugin_descs[name], "empty description for %s" % name
     assert stub.localvars.get("nick") == "alice", \
@@ -424,7 +538,15 @@ def main():
     pump_and_drain(client)
     hello = json.loads(recv_lines.pop(0))
     assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], hello
-    assert "pi connected" in buffer_text(stub)
+    # an accepted hello reads as a nick joining the buffer's channel: WeeChat's
+    # join prefix in the prefix column, hostmask and channel in the body
+    join_rows = [(tg, p, b) for tg, p, b in stub.printf_tags if "irc_join" in tg]
+    assert len(join_rows) == 1, \
+        "only an authed client joins (handshake rejections joined nothing): %r" % (join_rows,)
+    tags, prefix, body = join_rows[0]
+    assert tags == "irc_join,nick_pi,host_pi@localhost,notify_none", tags
+    assert prefix == "g-->", prefix         # chat_prefix_join fallback; TAB splits it
+    assert body.startswith("gpiC (~pi@localhost)g has joined W#pi"), body
 
     # pi → weechat: mirror output into the buffer
     send({"type": "session_info", "cwd": "/home/x/proj", "model": "prov/model-a"})
@@ -469,7 +591,7 @@ def main():
           if "notify_highlight" in tags]
     assert len(hl) == 1, "settle emits exactly one highlight line"
     assert hl[0][1] == "", "highlight line has no nick prefix"
-    assert hl[0][2].strip("G0") == "✔ ready!", "highlight line text"
+    assert hl[0][2].strip("G\x1c") == "✔ ready!", "highlight line text"
     n_printf = len(stub.printf_tags)
     send({"type": "status", "state": "idle"})  # idle → idle: not a settle
     pump_and_drain(client, 0.2)
@@ -590,18 +712,19 @@ def main():
     assert ns["_theme"]("no_such_name", "white") == "W", \
         "undefined theme names fall back to the palette color"
 
-    # weechat → pi: user input over the wire
+    # weechat → pi: user input over the wire (plain text steers by default)
     ns["pi_input_cb"]("", "buffer", "hello from weechat")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "hello from weechat"}, msg
+    assert msg == {"type": "user_input", "text": "hello from weechat",
+                   "deliverAs": "steer"}, msg
 
-    # steer prefix maps to deliverAs
-    ns["pi_input_cb"]("", "buffer", "!s do this instead")
+    # !q prefix maps to deliverAs: followUp
+    ns["pi_input_cb"]("", "buffer", "!q and then that")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "do this instead",
-                   "deliverAs": "steer"}, msg
+    assert msg == {"type": "user_input", "text": "and then that",
+                   "deliverAs": "followUp"}, msg
 
     # control command routing
     ns["pi_input_cb"]("", "buffer", "!new")
@@ -618,7 +741,7 @@ def main():
     assert all("alice" in p for p, _ in me_rows), \
         "user lines carry the user's nick as the line prefix"
     assert "hello from weechat" in me_lines, "buffer input echo under user nick"
-    assert "!s do this instead" in me_lines, "!s echo under user nick"
+    assert "!q and then that" in me_lines, "!q echo under user nick"
     assert not any(t.startswith("> ") for t in me_lines), \
         "user-nick lines must not carry the legacy '> ' marker"
 
@@ -659,6 +782,14 @@ def main():
     assert "!pick cancel" in text, "hint line must mention !pick"
     assert SESSION.pending_ui is not None and SESSION.pending_ui["id"] == 7
     assert stub.title == "π: %s (idle · last run 17m · 10 turns) — awaiting !pick" % proj, stub.title
+    # the "?" title line is the prompt's only tagged line and carries
+    # notify_highlight (like the ready banner): the user must !pick, so an
+    # off-screen buffer pings — options + hint stay plain prnt (no notify)
+    prompt_rows = [row for row in stub.printf_tags
+                   if row[2].startswith("C? ")]
+    assert len(prompt_rows) == 1, "exactly one tagged line per prompt"
+    assert "notify_highlight" in prompt_rows[0][0], prompt_rows
+    assert "No exact match for /x. Which directory?" in prompt_rows[0][2]
 
     # !pick by number → ui_response with the option text; title hint clears
     ns["pi_input_cb"]("", "buffer", "!pick 2")
@@ -733,6 +864,10 @@ def main():
     pump_and_drain(client, 0.2)
     assert "!pick <your answer>" in buffer_text(stub)
     assert "type something…" in buffer_text(stub), "placeholder must render"
+    in_rows = [row for row in stub.printf_tags
+               if row[2].startswith("C? Enter a value")]
+    assert in_rows and "notify_highlight" in in_rows[0][0], \
+        "input prompt title must ping too"
     ns["pi_input_cb"]("", "buffer", "!pick hello world")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
@@ -843,7 +978,7 @@ def main():
     # Nick prefixes — who-spoke rendering (pi_bridge.nicks + irc nicks)
     # ==================================================================
 
-    RS = "0"  # the stub's reset marker (real WeeChat: color:reset)
+    RS = "\x1c"  # the stub's reset marker, the code real WeeChat returns
     # the buffer localvar carries the user nick (first config entry);
     # user lines render in the prefix column under the real nick
     assert stub.localvars.get("nick") == "alice", \
@@ -854,7 +989,10 @@ def main():
     # assistant prose/fences → `pi`, tool lines + their output → the tool
     # name, thinking → `think`
     def nick_rows(tag):
-        return [(p, b) for tags, p, b in stub.printf_tags if tag in tags]
+        # the nick-column rows only: a lifecycle line also names `pi` (in its
+        # irc_join/irc_quit tags) but puts the join/quit prefix in the column
+        return [(p, b) for tags, p, b in stub.printf_tags
+                if tag in tags and "prefix_nick" in tags]
 
     pi_rows = nick_rows("nick_pi")
     assert pi_rows and all("pi" in p for p, _ in pi_rows), \
@@ -887,7 +1025,7 @@ def main():
                    for tags, p, _ in stub.printf_tags), \
         "a tool line is never labelled `pi` in auto mode"
 
-    # user lines (buffer input, !s echo, user_echo) render under the user's
+    # user lines (buffer input, !q echo, user_echo) render under the user's
     # nick — prefix_nick_chat_nick_self, no legacy '> ' marker in the text
     me_lines = [b for tags, _, b in stub.printf_tags if tags == me_tags]
     assert "typed in pi terminal" in me_lines, "user_echo under user nick"
@@ -1027,9 +1165,10 @@ def main():
     ns["pi_input_cb"]("", "buffer", "nickless line")
     pump_and_drain(client, 0.3)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "nickless line"}, \
+    assert msg == {"type": "user_input", "text": "nickless line",
+                   "deliverAs": "steer"}, \
         "the line still reaches pi (only the rendering falls back)"
-    assert any(k == "PRINT" and "> 0nickless line" in t
+    assert any(k == "PRINT" and "> \x1cnickless line" in t
                for k, t in stub.prints[n0:]), \
         "empty nicks ⇒ user line falls back to the '> ' marker via prnt"
     assert stub.printf_tags[n1:] == [], "no user-nick printf while nick is empty"
@@ -1044,8 +1183,8 @@ def main():
     # ==================================================================
 
     # color chars from the stub palette (see WeechatStub.color); C_DIM falls
-    # back to palette cyan, so fence lines render "C…0" like status lines
-    KW, STR, NUM, COM, FN, VAR, TYP, RS = "K", "G", "C", "d", "L", "E", "g", "0"
+    # back to palette cyan, so fence lines render cyan plus a reset like status lines
+    KW, STR, NUM, COM, FN, VAR, TYP, RS = "K", "G", "C", "d", "L", "E", "g", "\x1c"
     DIM = "C"
     hl = ns["highlight_code"]
 
@@ -1527,6 +1666,93 @@ def main():
             "%s is a rule of the same fixed length" % rule
         assert ns["_md_block_kind"](rule) == "hr"
     assert len(HR) == 20, "rules are a fixed length: no width is knowable here"
+    # --- tables (unit level): cell splitting, delimiter row, screen width
+    spl = ns["_md_split_row"]
+    assert spl("| a | b |") == ["a", "b"], "outer pipes are optional and stripped"
+    assert spl("a | b") == ["a", "b"], "no outer pipes at all"
+    assert spl("a | b |") == ["a", "b"], "only the trailing pipe is stripped"
+    assert spl("| a \\| b | c |") == ["a | b", "c"], \
+        "an escaped pipe stays inside its cell (and prints as a plain pipe)"
+    assert spl("| `a|b` | c |") == ["`a|b`", "c"], \
+        "a pipe inside a code span never splits a cell"
+    assert spl("| `a\\|b` | c |") == ["`a|b`", "c"], \
+        "an escaped pipe inside a code span is a literal pipe too"
+    assert spl("| a |  |") == ["a", ""], "an empty cell is still a cell"
+    assert spl("plain prose") == ["plain prose"], "no pipe: one cell, not a table line"
+    assert spl("| **b** | `c` |") == ["**b**", "`c`"], "cell text keeps its markers"
+
+    dlm = ns["_md_table_delimiter"]
+    assert dlm("|---|---|") == ["left", "left"], "the plain form"
+    assert dlm(":--|--:|:-:|-") == ["left", "right", "center", "left"], \
+        "colon placement is the alignment"
+    assert dlm(" --- | :-: ") == ["left", "center"], "padding around the cells is ignored"
+    assert dlm("---") is None, "a bare --- is a rule or an underline, not a delimiter"
+    assert dlm("| a | b |") is None, "a header row is not a delimiter row"
+    assert dlm("| --- | x |") is None, "one non-dash cell rejects the whole row"
+
+    row = ns["_md_is_table_row"]
+    assert row("| a | b |") and row("|---|:-:|") and row("a | b"), "rows and delimiter"
+    assert not row(""), "blank lines end a table"
+    assert not row("prose without pipes"), "prose ends a table"
+    assert not row("- item | x"), "a list marker is its own block"
+    assert not row("> quoted | x"), "a quote is its own block"
+    assert not row("# head | x"), "a heading is its own block"
+    assert not row("```"), "a fence is its own block"
+
+    wd = ns["_md_disp_width_py"]      # the twin used outside WeeChat, real code shapes
+    assert wd("abc") == 3
+    assert wd("\x19F11red\x1c") == 3, "palette color codes cost no columns"
+    assert wd("\x1901x\x1c") == 1, "theme color codes cost no columns"
+    assert wd("\x19F@00236x\x1c") == 1, "extended color codes cost no columns"
+    assert wd("\x1a\x01bold\x1c") == 4, "attribute codes cost no columns"
+    assert wd("中文") == 4, "wide characters cost two columns"
+    assert wd("a\u0336b") == 2, "the strikethrough overlay costs nothing"
+    assert ns["_md_disp_width"]("plain") == 5, "the WeeChat path agrees on plain text"
+    # strlen_screen is a recent binding: a WeeChat without it measures on its own
+    saved = ns["_STRLEN_SCREEN"]
+    ns["_STRLEN_SCREEN"] = None
+    try:
+        assert ns["_md_disp_width"]("中文 \x1a\x01x\x1c") == 6, \
+            "without the binding the bridge strips the codes and measures itself"
+    finally:
+        ns["_STRLEN_SCREEN"] = saved
+
+    # two width implementations is a divergence risk: the binding is what production
+    # pads by, so the fallback has to agree with it on every shape a cell can hold
+    for sample in ("", "abc", "中文", "日本語テキスト", "a\u0336b", "café", "😀 hi",
+                   "\x19F11red\x1c", "\x1901x\x1c", "\x19F@00236x\x1c", "\x1a\x01bold\x1c",
+                   "\x19F13\x1a\x04**two styles**\x1c", "  spaced  ", "| no pipes here |"):
+        assert ns["_md_disp_width"](sample) == ns["_md_disp_width_py"](sample), \
+            "strlen_screen and the local measure disagree on %r" % sample
+
+    def plain_grid(line):
+        """A grid line as the reader sees it: the bridge's codes and the strike
+        overlay removed, so a snapshot reads as the box printed."""
+        return re.sub(r"\x1a.|[\x18\x1c]", "", line).replace("\u0336", "")
+
+    assert [plain_grid(t) for t in ns["_md_render_table"](
+        ["| file | size | notes |", "|:---|---:|:-:|",
+         "| main.c | 12 KiB | ok |", "| util.c | 1 KiB | hot |"])] == [
+        "┌────────┬────────┬───────┐",
+        "│ file   │   size │ notes │",
+        "├────────┼────────┼───────┤",
+        "│ main.c │ 12 KiB │  ok   │",
+        "│ util.c │  1 KiB │  hot  │",
+        "└────────┴────────┴───────┘"], \
+        "columns aligned by their widest cell, one rule under the header only"
+    assert [plain_grid(t) for t in ns["_md_render_table"](
+        ["| name | **n** | note |", "|:---|---:|:-:|",
+         "| 中文 | 1 | ok |", "| a\\|b | ~~two~~ | *em* |"])] == [
+        "┌──────┬─────┬──────┐",
+        "│ name │   n │ note │",
+        "├──────┼─────┼──────┤",
+        "│ 中文 │   1 │  ok  │",
+        "│ a|b  │ two │  em  │",
+        "└──────┴─────┴──────┘"], (
+            "wide characters cost two columns, while bold, italic and the strike "
+            "overlay cost nothing: a cell reserves exactly what it displays")
+    assert ns["_md_render_table"](["| a | b |"]) is None, \
+        "no delimiter row means no table, so nothing to render"
 
     # a quote ends where a paragraph starts, and rules stand alone
     n0 = len(stub.prints)
@@ -1553,6 +1779,202 @@ def main():
     assert md_fresh(n0) == ["a paragraph" + RS, "", DIMA + HR + RS], \
         "--- after a blank is a rule, at the end of a message as much as at its start"
 
+    # --- tables (buffer level): the block waits for every row, then the grid lands
+    n0 = len(stub.prints)
+    for text in ("| file | size |", "|:---|---:|",
+                 "| main.c | 12 KiB | extra |", "| 中文 | 1 |"):
+        send({"type": "assistant_line", "msgId": 81, "text": text})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], \
+        "a table waits for every row: the column widths are only knowable at the end"
+    send({"type": "assistant_line", "msgId": 81, "text": ""})   # the blank ends it
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert [plain_grid(t) for t in sent] == [
+        "┌────────┬────────┐",
+        "│ file   │   size │",
+        "├────────┼────────┤",
+        "│ main.c │ 12 KiB │",
+        "│ 中文   │      1 │",
+        "└────────┴────────┘"], \
+        "the grid: a row wider than the header is truncated to its columns"
+    assert len(sent) == 6, "frame, header, rule, rows, frame — and nothing else"
+    assert sent[0].startswith(ns["MD_TABLE_STYLE"]), "the frame is dim, not colored"
+    assert ns["A_BOLD"] in sent[1] and ns["A_BOLD"] not in sent[3], \
+        "the header row is bold, the body is not"
+    send({"type": "assistant_line", "msgId": 81, "text": "done"})
+    send({"type": "assistant_flush", "msgId": 81})
+    pump_and_drain(client)
+    assert md_fresh(n0)[6:] == ["", "done" + RS], \
+        "the blank that ended the table is owed, and printed before what follows it"
+
+    n0 = len(stub.prints)
+    for text in ("> | a | b |", "> |:--|--:|", "> | 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 82, "text": text})
+    send({"type": "assistant_flush", "msgId": 82})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert [plain_grid(t) for t in sent] == [
+        "│ ┌───┬───┐", "│ │ a │ b │", "│ ├───┼───┤", "│ │ 1 │ 2 │", "│ └───┴───┘"], \
+        "a table inside a quote keeps its grid, behind the quote bar"
+    assert QS in sent[0], "and it keeps the quote's own style"
+    # a runaway table inside a quote degrades the same way as one at top level
+    cap = ns["MD_TABLE_MAX_ROWS"]
+    ns["MD_TABLE_MAX_ROWS"] = 2
+    n0 = len(stub.prints)
+    for text in ("> | a | b |", "> |:--|--:|", "> | 1 | 2 |", "> | 3 | 4 |"):
+        send({"type": "assistant_line", "msgId": 97, "text": text})
+    send({"type": "assistant_flush", "msgId": 97})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = cap
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), "a capped quoted table draws no grid"
+    assert [t for t in sent if "|" in t] == [
+        BAR + QS + t + RS for t in ("| a | b |", "|:--|--:|", "| 1 | 2 |", "| 3 | 4 |")], \
+        "every quoted row appears once, behind the quote bar, as written"
+
+
+    n0 = len(stub.prints)
+    for text in ("- run it", "  | a | b |", "  |---|---|", "  | 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 83, "text": text})
+    send({"type": "assistant_flush", "msgId": 83})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), \
+        "a table nested in a list item stays plain text (v1 scope)"
+    assert any("| a | b |" in t for t in sent), "as the text pi wrote it"
+
+    n0 = len(stub.prints)
+    for text in ("two lines", "of prose | here", "|---|---|"):
+        send({"type": "assistant_line", "msgId": 84, "text": text})
+    send({"type": "assistant_flush", "msgId": 84})
+    pump_and_drain(client)
+    assert not any("┌" in t for t in md_fresh(n0)), \
+        "a delimiter row after prose is prose, not a table header"
+
+    n0 = len(stub.prints)
+    for text in ("| only |", "---"):
+        send({"type": "assistant_line", "msgId": 85, "text": text})
+    send({"type": "assistant_flush", "msgId": 85})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [HEAD + BOLD + "| only |" + RS], \
+        "a one-column table whose dashes carry no pipes is a setext heading (known v1 edge)"
+
+    # a table the stream never finishes still prints, as a grid of the rows it got
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 86, "text": text})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "the next message has not arrived yet"
+    send({"type": "assistant_line", "msgId": 87, "text": "next message"})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert plain_grid(sent[0]).startswith("┌") and "│ 1 │ 2 │" in plain_grid(sent[3]), \
+        "the interrupted table is flushed as the grid of the rows that made it"
+    send({"type": "assistant_flush", "msgId": 87})
+    pump_and_drain(client)
+
+    # a runaway table degrades to plain text instead of holding the buffer hostage
+    rows, limit = ns["MD_TABLE_MAX_ROWS"], ns["MD_TABLE_MAX_BYTES"]
+    ns["MD_TABLE_MAX_ROWS"] = 3
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "| 5 | 6 |"):
+        send({"type": "assistant_line", "msgId": 88, "text": text})
+    send({"type": "assistant_flush", "msgId": 88})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = rows
+    assert md_fresh(n0) == [t + RS for t in
+                            ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "| 5 | 6 |")], \
+        "past the row cap every row prints exactly as it arrived, and no grid is drawn"
+
+    ns["MD_TABLE_MAX_BYTES"] = 24
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| a fairly long cell | and another |"):
+        send({"type": "assistant_line", "msgId": 89, "text": text})
+    send({"type": "assistant_flush", "msgId": 89})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_BYTES"] = limit
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), "the byte cap degrades to plain text too"
+    assert any("fairly long cell" in t for t in sent), "nothing is dropped on the way"
+    # overflow terminated by prose (no blank line in sight): the raw rows print once,
+    # in order, and the block *after* the degraded one renders markdown again — the
+    # plain mode belongs to the table block, not to the rest of the message
+    rows = ns["MD_TABLE_MAX_ROWS"]
+    ns["MD_TABLE_MAX_ROWS"] = 3
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "# then a heading"):
+        send({"type": "assistant_line", "msgId": 94, "text": text})
+    send({"type": "assistant_flush", "msgId": 94})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = rows
+    sent = md_fresh(n0)
+    assert sum(1 for t in sent if "| 3 | 4 |" in t) == 1, \
+        "the row that tripped the cap prints exactly once, not twice"
+    assert not any("┌" in t for t in sent), "and no grid is drawn around the overflow"
+    assert sent == [t + RS for t in
+                    ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |")] + \
+        [HEAD + BOLD + UNDER + "then a heading" + RS], \
+        "markdown rendering resumes for the block after a degraded table"
+
+    # a code span inside a cell is highlighted, and the columns still line up
+    n0 = len(stub.prints)
+    for text in ("| cmd | rc |", "|---|---|", "| `git status` | ok |"):
+        send({"type": "assistant_line", "msgId": 90, "text": text})
+    send({"type": "assistant_flush", "msgId": 90})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert any(ns["C_CODE"] in t and "git status" in t for t in sent), \
+        "inline code inside a cell renders like inline code in prose"
+    assert sum(t.count("│") for t in (sent[1], sent[3])) == 6, \
+        "two columns, three boundaries: styled cells sit on the same ones"
+
+    # with rendering off, a table is the source text pipes and all
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 91, "text": text})
+    send({"type": "assistant_flush", "msgId": 91})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [t + RS for t in ("| a | b |", "|---|---|", "| 1 | 2 |")], \
+        "markdown off: the table reaches the buffer exactly as pi wrote it"
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+
+    # the table lookahead must not swallow an ordinary last line: a single-line
+    # paragraph held for a possible delimiter row still prints when the message ends
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 92, "text": "the last line of the reply"})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "it waits one line, in case a delimiter row follows"
+    send({"type": "assistant_flush", "msgId": 92})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["the last line of the reply" + RS], \
+        "the end of the message prints the held paragraph as prose"
+
+    # a held line also flushes in the right order when the next construct is not a
+    # delimiter row: a fence, a list, or a blank line each cut in after the prose
+    n0 = len(stub.prints)
+    for text in ("one prose line", "```bash", "ls -l", "```"):
+        send({"type": "assistant_line", "msgId": 95, "text": text})
+    send({"type": "assistant_flush", "msgId": 95})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "one prose line" + RS, \
+        "the held paragraph prints before the fence that ends it"
+    assert any("ls -l" in t for t in fresh[1:]), "and the fence follows it, intact"
+
+    n0 = len(stub.prints)
+    for text in ("a lone line", "- first item"):
+        send({"type": "assistant_line", "msgId": 96, "text": text})
+    send({"type": "assistant_flush", "msgId": 96})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "a lone line" + RS and fresh[1] == "\u2022 first item" + RS, \
+        "a list opens after the held line, not before it"
+
+
     # client disconnect → title back to waiting (unix client is done)
     # an unfinished call leaves an entry in the toolCallId→nick map; a new
     # connection can never complete it, so disconnect must drop the whole map
@@ -1566,6 +1988,7 @@ def main():
     assert not any("stranded by disconnect" in t for k, t in stub.prints), \
         "the block is still pending while the connection is up"
 
+    quit_seen_before = len(stub.printf_tags)
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
@@ -1576,6 +1999,14 @@ def main():
         "disconnect resets the block accumulator"
     assert SESSION.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
     assert SESSION.timing_snapshot is None, "disconnect must discard the stale snapshot"
+
+    # a peer-closed connection reads as the nick leaving the channel, with the
+    # reason WeeChat shows for a client that hung up
+    quit_rows = [(tg, p, b) for tg, p, b in stub.printf_tags[quit_seen_before:]
+                 if "irc_quit" in tg]
+    assert quit_rows == [("irc_quit,nick_pi,host_pi@localhost,notify_none",
+                          "R<--",
+                          "RpiC (~pi@localhost)R has quit d(Client Quit)")], quit_rows
 
     # ==================================================================
     # Phase D — TCP listener
@@ -1629,8 +2060,11 @@ def main():
     hello = json.loads(lines[0])
     assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], \
         "server hello only after a valid proof"
-    assert "pi connected from 127.0.0.1" in buffer_text(stub), \
-        "connect line names the TCP peer IP"
+    tcp_join = [b for tg, p, b in stub.printf_tags
+                if tg == "irc_join,nick_pi,host_pi@127.0.0.1,notify_none"]
+    assert tcp_join and "(~pi@127.0.0.1)" in tcp_join[-1] \
+        and " has joined " in tcp_join[-1], \
+        "join line names the TCP peer address"
 
     # ping/pong proves the dispatch path is live over TCP
     send_line(tc, {"type": "ping", "ts": 7})
@@ -1916,12 +2350,12 @@ def main():
     assert s2.pending_ui is not None
     s3.on_input("!pick 1")
     stub.pump(0.2)
-    assert any("nothing to pick" in l for l in stub.buf_prints[s3.buffer])
+    assert any("nothing to pick" in line for line in stub.buf_prints[s3.buffer])
     s2.on_input("!pick 2")
     stub.pump(0.2)
     lines = []
     drain(m2, lines)
-    resp = [json.loads(l) for l in lines if json.loads(l)["type"] == "ui_response"]
+    resp = [json.loads(line) for line in lines if json.loads(line)["type"] == "ui_response"]
     assert resp and resp[0].get("value") == "y", resp
     # tidy up the phase's clients
     for cl in (m2, m4, m5):
@@ -2030,7 +2464,7 @@ def main():
     stub.pump(0.2)
     out = []
     drain(ma2, out)
-    assert not any(b"ui_response" in l for l in out), out
+    assert not any(b"ui_response" in chunk for chunk in out), out
     assert any("nothing to pick" in m for m in stub.buf_prints.get(sa.buffer, [])), stub.buf_names
     # tidy up
     for cl in (m6, m7, m8b, m8c, m9b, ma2):
@@ -2082,6 +2516,212 @@ def main():
         cl.close()
     stub.pump(0.3)
     assert BRIDGE.clients == []
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
+    # ==================================================================
+    # Phase N — auto_clean: close a buffer whose pi connection is gone and
+    # that printed nothing for pi_bridge.auto_clean hours (default 24)
+    # ==================================================================
+    stub.reset_stale_calls()
+    assert ns["AUTO_CLEAN_SWEEP_S"] == 3600, "the sweep runs once an hour"
+    # Phase M3 left every client closed. `other` is the session whose buffer a
+    # user closed by hand: no buffer, no connection → the sweep drops the Session.
+    assert other.alive is False and other.buffer is None
+    assert other in BRIDGE.sessions
+    assert BRIDGE.sweep_idle_sessions() == 0, "no buffer is old enough yet"
+    assert other not in BRIDGE.sessions, "hand-closed session dropped by the sweep"
+    assert all(v is not other for v in BRIDGE.session_by_buffer.values())
+    assert all(v is not other for v in BRIDGE.session_by_id.values())
+
+    def n_client(session_id, cwd):
+        cl = unix_client()
+        assert client_hello(cl, session_id=session_id)["type"] == "hello"
+        cl.sendall((json.dumps({"type": "session_info", "sessionId": session_id,
+                                "cwd": cwd}) + "\n").encode())
+        stub.pump(0.2)
+        return cl, BRIDGE.session_by_id[session_id]
+
+    live_cl, live = n_client("sid-live", "/home/x/live")
+    aged_cl, aged = n_client("sid-aged", "/home/x/aged")
+    young_cl, young = n_client("sid-young", "/home/x/young")
+    window_cl, window = n_client("sid-window", "/home/x/window")
+    current_cl, current = n_client("sid-current", "/home/x/current")
+    typed_cl, typed = n_client("sid-typed", "/home/x/typed")
+    assert live is BRIDGE.load_session, "the first client takes the load-time session"
+    assert stub.buf_names[live.buffer] == "pi"
+    aged_name, aged_buf = stub.buf_names[aged.buffer], aged.buffer
+
+    # Only `live` keeps its connection; each disconnect prints one line.
+    for cl in (aged_cl, young_cl, window_cl, current_cl, typed_cl):
+        cl.close()
+    stub.pump(0.4)
+    assert all(s.conn is None for s in (aged, young, window, current, typed))
+    assert live.conn is not None
+
+    # Idle age comes from the buffer's newest line date: rewrite those dates
+    # instead of sleeping. Guards are set the way WeeChat reports them.
+    stub.age_buffer(aged.buffer, 25 * 3600)
+    stub.age_buffer(young.buffer, 23 * 3600)
+    stub.age_buffer(window.buffer, 25 * 3600)
+    stub.age_buffer(current.buffer, 25 * 3600)
+    stub.age_buffer(typed.buffer, 25 * 3600)
+    stub.age_buffer(live.buffer, 30 * 3600)      # old and quiet, but still connected
+    stub.show_in_window(window.buffer)           # buffer_get_string → first_window
+    stub.current_buf = current.buffer            # current_buffer()
+    stub.set_input_line(typed.buffer, "half a line")
+
+    assert BRIDGE.sweep_idle_sessions() == 1, "only the plain aged buffer closes"
+    assert aged.alive is False and aged.buffer is None
+    assert aged not in BRIDGE.sessions, "closed session dropped from the registry"
+    assert all(v is not aged for v in BRIDGE.session_by_buffer.values())
+    assert "sid-aged" not in BRIDGE.session_by_id, "a reaped id is forgotten"
+    assert aged_buf not in stub.buf_names, "the closed buffer's name is released"
+    assert stub.buf_prints.get(aged_buf) is None
+    notice = [t for k, t in stub.prints if "closed idle buffer" in t]
+    assert len(notice) == 1 and aged_name in notice[0] and "idle 25h" in notice[0], notice
+    # 23 h under the 24 h limit, a live connection, a window, the current
+    # buffer, and text on the input line all keep their buffers.
+    assert young.buffer is not None, "23 h is under the 24 h limit"
+    assert window.buffer is not None, "a buffer shown in a window is never closed"
+    assert current.buffer is not None, "the buffer in the current window is kept"
+    assert typed.buffer is not None, "text on the input line keeps the buffer"
+    assert live.buffer is not None and live.alive, "a live pi session keeps its buffer"
+    hints = [t for k, t in stub.prints if "shown in a window" in t]
+    assert len(hints) == 2 and any("/home/x/window" in t for t in hints), hints
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
+
+    # The id the sweep reaped now starts a NEW session (no history), and its
+    # buffer takes the name the sweep released.
+    reborn_cl, reborn = n_client("sid-aged", "/home/x/aged")
+    assert reborn is not aged, "a reaped session id does not reattach"
+    assert reborn.buffer != aged_buf
+    assert stub.buf_names[reborn.buffer] == aged_name, "a freed name is reusable"
+
+    # Release the guards: the next hourly pass closes all three.
+    stub.hide_from_window(window.buffer)
+    stub.current_buf = None
+    stub.set_input_line(typed.buffer, "")
+    assert BRIDGE.sweep_idle_sessions() == 3, "unguarded idle buffers close"
+    assert all(s.buffer is None for s in (window, current, typed))
+
+    # A quiet buffer closes when it crosses the limit, not before.
+    stub.age_buffer(young.buffer, 2 * 3600)      # 23 h → 25 h
+    assert BRIDGE.sweep_idle_sessions() == 1
+    assert young.buffer is None and young not in BRIDGE.sessions
+
+    # The load-time `pi` buffer ages from WeeChat's start; a later hello must
+    # give that Session a buffer again instead of dropping its output.
+    live_cl.close()
+    stub.pump(0.4)
+    # The disconnect line is now the newest line, so it is what gets aged.
+    stub.age_buffer(live.buffer, 25 * 3600)
+    assert BRIDGE.sweep_idle_sessions() == 1
+    assert live.buffer is None and live not in BRIDGE.sessions, "the pi buffer was reaped"
+    load_cl, back = n_client("sid-load", "/home/x/load")
+    assert back is BRIDGE.load_session is live, "the load-time Session is reused"
+    assert back in BRIDGE.sessions, "and put back in the session list"
+    assert back.alive and back.buffer and stub.buf_names[back.buffer] == "pi", \
+        "_handle_hello recreated the buffer"
+    load_cl.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                                 "text": "renders again"}) + "\n").encode())
+    load_cl.sendall((json.dumps({"type": "assistant_flush", "msgId": 1}) + "\n").encode())
+    stub.pump(0.3)
+    assert any("renders again" in m for m in stub.buf_prints[back.buffer]), \
+        "the recreated buffer renders"
+
+    # auto_clean 0 and a garbage value: nothing closes, and /set says why.
+    reborn_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(reborn.buffer, 25 * 3600)
+    stub.config_set_plugin("auto_clean", "0")
+    assert any("auto_clean off" in t for k, t in stub.prints), stub.prints[-3:]
+    assert BRIDGE.sweep_idle_sessions() == 0 and reborn.buffer is not None, \
+        "auto_clean 0 keeps every buffer"
+    stub.config_set_plugin("auto_clean", "abc")
+    assert any("not a number of hours" in t for k, t in stub.prints), stub.prints[-3:]
+    assert BRIDGE.sweep_idle_sessions() == 0 and reborn.buffer is not None, \
+        "a garbage value behaves as disabled"
+    # A valid /set sweeps at once — no reload, no waiting for the timer.
+    mark = len(stub.prints)
+    stub.config_set_plugin("auto_clean", "24")
+    assert reborn.buffer is None and reborn not in BRIDGE.sessions, \
+        "the /set sweep closed it immediately"
+    assert any("closed idle buffer" in t for k, t in stub.prints[mark:])
+
+    # A bad value must not leave an earlier threshold in force. A buffer that
+    # died later survives the next sweep and the hourly timer, and closes only
+    # when a usable value returns.
+    stale_cl, stale_s = n_client("sid-stale", "/home/x/stale")
+    stale_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(stale_s.buffer, 25 * 3600)
+    stub.config_set_plugin("auto_clean", "abc")
+    assert BRIDGE.sweep_idle_sessions() == 0 and stale_s.buffer is not None, \
+        "a garbage value closes nothing, not even a newer idle buffer"
+    ns["pi_auto_clean_cb"]("")
+    assert stale_s.buffer is not None, "the hourly timer sweep keeps it too"
+    stub.config_set_plugin("auto_clean", "0.001")
+    assert stale_s.buffer is None and stale_s not in BRIDGE.sessions, \
+        "a usable value closes it at once"
+
+    # A close WeeChat refuses changes nothing and warns; the next sweep retries.
+    refused_cl, refused = n_client("sid-refused", "/home/x/refused")
+    refused_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(refused.buffer, 25 * 3600)
+    real_close = stub.buffer_close
+    stub.buffer_close = lambda buf: 0
+    assert BRIDGE.sweep_idle_sessions() == 0, "a refused close closes nothing"
+    stub.buffer_close = real_close
+    assert any("could not close idle buffer" in t for k, t in stub.prints), stub.prints[-3:]
+    assert refused.buffer is not None and refused.alive and refused in BRIDGE.sessions, \
+        "nothing was torn down after a refused close"
+    assert BRIDGE.sweep_idle_sessions() == 1, "the next sweep retries and succeeds"
+    assert refused.buffer is None and refused not in BRIDGE.sessions
+
+    # A sweep started inside a sweep (a /set landing mid-close) does nothing.
+    nested_cl, nested_s = n_client("sid-nested", "/home/x/nested")
+    nested_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(nested_s.buffer, 25 * 3600)
+    nested_results = []
+
+    def close_with_nested(buf):
+        nested_results.append(BRIDGE.sweep_idle_sessions())   # re-entrant call
+        return real_close(buf)
+
+    stub.buffer_close = close_with_nested
+    assert BRIDGE.sweep_idle_sessions() == 1
+    stub.buffer_close = real_close
+    assert nested_results == [0], "the re-entrancy guard blocked the nested sweep"
+    assert nested_s.buffer is None and nested_s not in BRIDGE.sessions
+    assert BRIDGE._sweeping is False, "the guard is cleared even after a nested call"
+
+    # Date handling, straight through the stub's buffer_lines infolist.
+    now = time.time()
+    assert ns["_line_age"](now, None) is None and ns["_line_age"](now, 0) is None
+    assert ns["_line_age"](now, now + 500) == 0.0, "a future date reads as just printed"
+    assert abs(ns["_line_age"](now, now - 3600) - 3600) < 1
+    assert abs(ns["_line_age"](now, int((now - 3600) * 1000)) - 3600) < 5, \
+        "a millisecond-sized date is read as milliseconds"
+    probe = stub.buffer_new("empty-probe", "pi_input_cb", "", "pi_close_cb", "")
+    assert ns["_last_line_date"](probe) is None, "an empty buffer has no age"
+    zero = stub.buffer_new("zerodate-probe", "pi_input_cb", "", "pi_close_cb", "")
+    stub.buf_lines[zero] = [[now - 30 * 3600, "old"], [0, "internal"]]
+    assert ns["_last_line_date"](zero) == now - 30 * 3600, "date-0 lines are skipped"
+    # A Session whose buffer holds no dated line is kept: age 0 would be a guess.
+    quiet = ns["Session"](BRIDGE)
+    BRIDGE.sessions.append(quiet)
+    quiet.make_buffer("undated-probe")
+    stub.buf_lines[quiet.buffer] = [[0, "no real date"]]
+    assert BRIDGE.sweep_idle_sessions() == 0, "an undated buffer is never closed"
+    assert quiet in BRIDGE.sessions and quiet.buffer is not None
+
+    # main() hooked the hourly sweep; cleanup() must unhook it.
+    assert any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), stub.timers
+    ns["BRIDGE"].cleanup()
+    assert not any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), \
+        "cleanup() unhooks the auto-clean timer"
+    assert ns["BRIDGE"].auto_clean_hook is None
     assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""End-to-end nick rendering check inside a REAL WeeChat.
+"""End-to-end checks inside a REAL WeeChat.
 
 smoke_weechat.py drives pi_bridge.py through a stubbed `weechat` module; this
 drives it through an actual `weechat-headless` process and asserts on the lines
 WeeChat itself stored in the buffer — tags, the nick column, and the per-nick
-colors. Two runs:
+colors — and on which buffers WeeChat still has after an auto-clean sweep. Runs:
 
   1. default options (thinking on)  -> auto mode: tool lines under the tool's own nick
   2. plugins.conf with pi_bridge.nicks = pi, thinking = on
                                      -> legacy mode: every pi-side line under `pi`
+  3. /set … nicks pi on the FIFO     -> rendering switches live, no reload
+  4. pi_bridge.markdown = on         -> headings, emphasis, lists, quotes, table grids
+  5. pi_bridge.auto_clean            -> an idle buffer whose pi connection died is
+                                        closed; the connected one is kept
 
 Skips (exit 0) when weechat-headless is not installed.
 
@@ -39,7 +43,7 @@ weechat.register("nick_capture", "tor", "1.0", "MIT", "capture", "", "")
 
 def on_print(*args):
     """WeeChat 4.10 hands hook_print eight arguments:
-    (pointer, buffer, date, tags, notification, ?, prefix, message)."""
+    (pointer, buffer, date, tags, print_buffer, notification, prefix, message)."""
     try:
         buffer = weechat.buffer_get_string(args[1], "full_name")
     except Exception:
@@ -49,10 +53,11 @@ def on_print(*args):
             f.write(json.dumps({
                 "buffer": buffer,
                 "tags": args[3] or "",
-                "prefix": weechat.string_remove_color(args[6], ""),
-                "prefix_raw": args[6] or "",
-                "message": weechat.string_remove_color(args[7], ""),
-                "message_raw": args[7] or "",
+                "notification": args[5] if len(args) >= 8 else None,
+                "prefix": weechat.string_remove_color(args[-2], "") if len(args) >= 8 else "",
+                "prefix_raw": args[-2] if len(args) >= 8 else "",
+                "message": weechat.string_remove_color(args[-1], ""),
+                "message_raw": args[-1] or "",
             }) + "\\n")
     except OSError:
         pass
@@ -60,6 +65,25 @@ def on_print(*args):
 
 
 weechat.hook_print("", "", "", 0, "on_print", "")
+
+
+def dump_buffers(*args):
+    """Append the buffer names WeeChat currently has to <capture>.buffers."""
+    names = []
+    infolist = weechat.infolist_get("buffer", "", "")
+    while weechat.infolist_next(infolist):
+        names.append(weechat.infolist_string(infolist, "full_name"))
+    weechat.infolist_free(infolist)
+    try:
+        with open(CAPTURE + ".buffers", "a", encoding="utf-8") as f:
+            print(json.dumps(names), file=f)
+    except OSError:
+        pass
+    return weechat.WEECHAT_RC_OK
+
+
+weechat.hook_command("pi_capture_buffers", "list current buffer names for the tests",
+                     "", "", "", "dump_buffers", "")
 
 
 # Read-only lookup, after register(): the colors WeeChat would give these nicks.
@@ -129,6 +153,7 @@ def run_weechat(root: str, seed_conf: str | None,
         send({"type": "assistant_line", "msgId": 4, "text": "Bye."})
         time.sleep(1.5)
         c.close()
+        time.sleep(1.0)   # WeeChat must read the EOF and print the quit line first
         os.kill(proc.pid, signal.SIGTERM)
         try:
             proc.wait(timeout=15)
@@ -184,8 +209,106 @@ def run_weechat(root: str, seed_conf: str | None,
     return [r for r in rows if r["buffer"] == "python.pi"], colors
 
 
+def run_autoclean(seed_conf: str | None, clean_values: tuple[str, ...],
+                  late_dead: bool = False) -> tuple[list[dict], list[list[str]], str]:
+    """Boot a real WeeChat with two pi sessions, drop one, then drive
+    /set plugins.var.python.pi_bridge.auto_clean for each value in clean_values.
+
+    The option callback sweeps at once, so this needs seconds, not an hour:
+    0.001 h is 3.6 s. An empty clean_values tuple leaves the option untouched,
+    which is how a fresh install (24 hours) is checked. With late_dead, a third
+    session connects and dies between the first value and the next one, so a
+    later sweep can be caught closing a buffer it must not close. Returns every
+    line WeeChat printed, the buffer names dumped before and after the sweeps,
+    and the plugins.conf WeeChat wrote when it quit.
+    """
+    root = mkroot("autoclean")
+    home = os.path.join(root, "home")
+    sock = os.path.join(root, "pi.sock")
+    capture = os.path.join(root, "capture.jsonl")
+    autoload = os.path.join(home, "python", "autoload")
+    os.makedirs(autoload, exist_ok=True)
+    shutil.copy(BRIDGE, os.path.join(autoload, "pi_bridge.py"))
+    with open(os.path.join(autoload, "nick_capture.py"), "w", encoding="utf-8") as f:
+        f.write(CAPTURE_SHIM)
+    if seed_conf:
+        with open(os.path.join(home, "plugins.conf"), "w", encoding="utf-8") as f:
+            f.write(seed_conf)
+
+    env = dict(os.environ, HOME=home, PI_WEECHAT_SOCK=sock, PI_WEECHAT_CAPTURE=capture)
+    proc = subprocess.Popen(["weechat-headless", "-d", home], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(120):
+        if os.path.exists(sock):
+            break
+        time.sleep(0.25)
+    else:
+        proc.kill()
+        raise RuntimeError("pi_bridge never created its socket")
+
+    fifo = os.path.join(home, next(f for f in os.listdir(home)
+                                   if f.startswith("weechat_fifo_")))
+
+    def drive(command: str) -> None:
+        with open(fifo, "w") as f:
+            print("core.weechat */" + command, file=f)
+
+    def connect(session_id: str, cwd: str) -> socket.socket:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(5)
+        c.connect(sock)
+        hello = json.dumps({"type": "hello", "protocol": 3}).encode()
+        c.sendall(hello + b"\n")
+        c.recv(4096)
+        info = json.dumps({"type": "session_info", "sessionId": session_id,
+                           "cwd": cwd, "model": "opencode/gpt-5"})
+        c.sendall(info.encode() + b"\n")
+        return c
+
+    live = connect("s1", "/tmp/proj-live")      # keeps its connection all run
+    dead = connect("s2", "/tmp/proj-dead")      # its pi side goes away
+    time.sleep(2.0)
+    drive("pi_capture_buffers")                # both buffers exist at this point
+    time.sleep(1.0)
+    dead.close()                                # buffer stays open, pi is gone
+    time.sleep(6.0)                             # idle past 0.001 h, not past 24 h
+    for index, value in enumerate(clean_values):
+        drive("set plugins.var.python.pi_bridge.auto_clean %s" % value)
+        time.sleep(2.0)
+        if late_dead and index + 1 < len(clean_values):
+            # A third session that dies only after the first sweep, so the
+            # next sweep has an idle buffer it must leave alone.
+            late = connect("s3", "/tmp/proj-late")
+            time.sleep(1.0)
+            late.close()
+            time.sleep(6.0)
+    line = json.dumps({"type": "assistant_line", "msgId": 7,
+                       "text": "rendered after the sweep"})
+    live.sendall(line.encode() + b"\n")
+    time.sleep(1.5)
+    drive("pi_capture_buffers")                # buffer list after the sweep
+    # WeeChat writes plugins.conf when it quits, so no explicit save is needed
+    time.sleep(1.5)
+    live.close()
+    os.kill(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait()
+    rows = [json.loads(row) for row in open(capture, encoding="utf-8")]
+    dumps = [json.loads(row) for row in open(capture + ".buffers", encoding="utf-8")]
+    conf = open(os.path.join(home, "plugins.conf"), encoding="utf-8").read()
+    return rows, dumps, conf
+
+
 def has_nick(row: dict, nick: str) -> bool:
     return "nick_" + nick in row["tags"].split(",")
+
+def is_lifecycle(row: dict) -> bool:
+    """A join or quit line: its prefix is WeeChat's join/quit glyph, not a nick."""
+    tags = row["tags"].split(",")
+    return "irc_join" in tags or "irc_quit" in tags
 
 
 def check(label: str, ok: bool) -> bool:
@@ -226,7 +349,8 @@ def main() -> int:
         results.append(check("auto mode drops the tool name from the body",
                              not any("⚙ read" in r["message"] or "⚙ bash" in r["message"] for r in pi)))
         results.append(check("status lines keep no nick",
-                             any(r["prefix"] == "" and "connected" in r["message"] for r in pi)))
+                             any(r["prefix"] == "" and "session: /tmp/proj" in r["message"]
+                                 for r in pi)))
         results.append(check("nick tags are nick_<name> + prefix_nick_chat_nick",
                              all(r["tags"] == "notify_none,nick_read,prefix_nick_chat_nick" for r in read)))
         results.append(check("nick column carries an inline color (tags alone do not color it)",
@@ -235,6 +359,27 @@ def main() -> int:
                              read[0]["prefix_raw"] != bash[0]["prefix_raw"]))
         results.append(check("WeeChat resolves a color for every nick we print",
                              all(colors.get(n) for n in ("pi", "read", "bash", "think", "memory_search"))))
+
+        joins = [r for r in pi if "irc_join" in r["tags"].split(",")]
+        quits = [r for r in pi if "irc_quit" in r["tags"].split(",")]
+        results.append(check("one join on hello, one quit when the peer closes",
+                             len(joins) == 1 and len(quits) == 1))
+        if joins and quits:
+            j, q = joins[0], quits[0]
+            results.append(check("join/quit lines store WeeChat's own join/quit prefixes",
+                                 j["prefix"] == "-->" and q["prefix"] == "<--"))
+            results.append(check("join tags are irc_join + nick_pi + host_pi@<host> + notify_none",
+                                 j["tags"] == "irc_join,nick_pi,host_pi@localhost,notify_none"))
+            results.append(check("join body reads as the pi nick joining the buffer's channel",
+                                 j["message"] == "pi (~pi@localhost) has joined #pi"))
+            results.append(check("quit body gives the reason for a peer hang-up",
+                                 q["message"].endswith("has quit (Client Quit)")))
+            results.append(check("lifecycle lines take no smart filter and notify nothing",
+                                 all("irc_smart_filter" not in r["tags"] and not r["notification"]
+                                     for r in (j, q))))
+        results.append(check("no line reads like the old connected / disconnected notice",
+                             not any("pi connected" in r["message"]
+                                     or "pi disconnected" in r["message"] for r in pi)))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -274,8 +419,9 @@ def main() -> int:
                              any(has_nick(r, "read") for r in before)))
         results.append(check("after the switch: no per-tool nick tags",
                              not any(has_nick(r, "grep") or has_nick(r, "read") for r in after)))
-        results.append(check("after the switch: everything under the single nick pi",
-                             all("pi" in r["prefix_raw"] for r in after if r["prefix_raw"])))
+        results.append(check("after the switch: every nick line is under the single nick pi",
+                             all("pi" in r["prefix_raw"] for r in after
+                                 if r["prefix_raw"] and not is_lifecycle(r))))
         results.append(check("after the switch: tool name back in the body",
                              any("⚙ grep" in r["message"] for r in after)))
     finally:
@@ -296,6 +442,15 @@ def main() -> int:
             "",
             "> quoted line",
             ">> nested quote",
+            "",
+            "| file | size |",
+            "|:---|---:|",
+            "| main.c | 12 KiB | extra |",
+            "| 中文 | 1 |",
+            "",
+            "> | a | b |",
+            "> |:--|--:|",
+            "> | 1 | 2 |",
             "",
             "---",
             "## Heading with `code` and **bold**",
@@ -357,6 +512,33 @@ def main() -> int:
         results.append(check("blockquote gets a bar, a nested quote gets two",
                              len(quote) == 1 and quote[0]["message"].startswith("\u2502 ")
                              and len(nested) == 1 and nested[0]["message"].startswith("\u2502 \u2502 ")))
+        grid_top = [r for r in pi if r["message"].startswith("\u250c")]
+        grid_rule = [r for r in pi if r["message"].startswith("\u251c")]
+        grid_bot = [r for r in pi if r["message"].startswith("\u2514")]
+        grid_head = [r for r in pi if r["message"].startswith("\u2502 ") and "file" in r["message"]]
+        grid_row = [r for r in pi if r["message"].startswith("\u2502 ") and "main.c" in r["message"]]
+        grid_cjk = [r for r in pi if r["message"].startswith("\u2502 ") and "中文" in r["message"]]
+        quoted_grid = [r for r in pi if r["message"].startswith("\u2502 \u250c")]
+        results.append(check("table renders as a grid: frame, one rule under the header, rows",
+                             len(grid_top) == 1 and len(grid_rule) == 1 and len(grid_bot) == 1
+                             and len(grid_head) == 1 and len(grid_row) == 1))
+        results.append(check("the rule's joints and the rows' bars agree: columns are aligned",
+                             len(grid_top) == 1 and len(grid_head) == 1 and len(grid_cjk) == 1
+                             and grid_top[0]["message"].count("\u252c") + 2 ==
+                             grid_head[0]["message"].count("\u2502") ==
+                             grid_cjk[0]["message"].count("\u2502")))
+        results.append(check("the header row is bold and the frame is dim in the stored line",
+                             len(grid_head) == 1 and "\x1a\x01" in grid_head[0]["message_raw"]
+                             and len(grid_top) == 1 and "\x1a\x06" in grid_top[0]["message_raw"]))
+        results.append(check("a row wider than the header is truncated to its columns",
+                             len(grid_row) == 1 and "extra" not in grid_row[0]["message"]))
+        results.append(check("a table inside a quote keeps its grid behind the quote bar",
+                             len(quoted_grid) == 1
+                             and quoted_grid[0]["message"].startswith("\u2502 \u250c")))
+        results.append(check("the source rows are not printed next to the grid",
+                             not any("| main.c | 12 KiB" in r["message"] for r in pi)))
+        results.append(check("grid lines keep the pi nick prefix",
+                             all(has_nick(r, "pi") for r in grid_top + grid_head + grid_row)))
         results.append(check("horizontal rule renders as a box-drawing line", len(rules) == 1))
         results.append(check("a long line stays one buffer line (client wraps it, not the bridge)",
                              len(long) == 1 and len(long[0]["message"]) > 200))
@@ -368,6 +550,93 @@ def main() -> int:
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
+    # --- auto_clean: an idle buffer with a dead pi connection is closed -----
+    root = mkroot("autoclean")
+    try:
+        rows, dumps, conf = run_autoclean(None, ("0.001",))
+        before, after = dumps[0], dumps[-1]
+        print("\n=== auto_clean 0.001 h (3.6 s), one of two sessions disconnected ===")
+        print("  buffers before: %s" % before)
+        print("  buffers after:  %s" % after)
+        results.append(check("both session buffers exist before the sweep",
+                             any(n == "python.pi" for n in before)
+                             and sum("proj-dead" in n for n in before) == 1))
+        results.append(check("the live session's buffer python.pi survives the sweep",
+                             "python.pi" in after))
+        results.append(check("the disconnected session's idle buffer is closed",
+                             not any("proj-dead" in n for n in after)))
+        closed = [r for r in rows if "closed idle buffer" in r["message"]]
+        results.append(check("the close is reported on the core buffer, with buffer name "
+                             "and idle time", len(closed) == 1
+                             and "proj-dead" in closed[0]["message"]
+                             and "idle " in closed[0]["message"]
+                             and closed[0]["buffer"] == "core.weechat"))
+        later = [r for r in rows if "rendered after the sweep" in r["message"]]
+        results.append(check("the live session keeps rendering after the sweep",
+                             len(later) == 1 and later[0]["buffer"] == "python.pi"))
+        results.append(check("the /set value is what WeeChat saves on quit",
+                             'python.pi_bridge.auto_clean = "0.001"' in conf))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- auto_clean default: a fresh install gets 24 hours ------------------
+    root = mkroot("autoclean-default")
+    try:
+        rows, dumps, conf = run_autoclean(None, ())
+        after = dumps[-1]
+        print("\n=== auto_clean never set (default 24 h) ===")
+        print("  buffers after:  %s" % after)
+        results.append(check("a fresh install writes auto_clean = 24 to plugins.conf",
+                             'python.pi_bridge.auto_clean = "24"' in conf))
+        results.append(check("the 24 h default leaves a 6 s idle buffer open",
+                             "python.pi" in after
+                             and any("proj-dead" in n for n in after)))
+        results.append(check("the default run closes nothing",
+                             not any("closed idle buffer" in r["message"] for r in rows)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- auto_clean 0: nothing is ever closed --------------------------------
+    root = mkroot("autoclean-off")
+    try:
+        seed = '[var]\npython.pi_bridge.auto_clean = "0"\n'
+        rows, dumps, conf = run_autoclean(seed, ("0",))
+        after = dumps[-1]
+        print("\n=== auto_clean 0 (disabled) ===")
+        print("  buffers after:  %s" % after)
+        results.append(check("auto_clean 0 keeps the disconnected session's buffer",
+                             "python.pi" in after and any("proj-dead" in n for n in after)))
+        results.append(check("nothing is reported closed",
+                             not any("closed idle buffer" in r["message"] for r in rows)))
+        results.append(check("a seeded 0 is kept, not overwritten by the default",
+                             'python.pi_bridge.auto_clean = "0"' in conf))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- auto_clean with a bad value: warning, and nothing closes -----------
+    root = mkroot("autoclean-bad")
+    try:
+        rows, dumps, conf = run_autoclean(None, ("0.001", "abc", "abc", "24"),
+                                          late_dead=True)
+        after = dumps[-1]
+        print("\n=== auto_clean 0.001 h, then abc twice, then 24 h ===")
+        print("  buffers after:  %s" % after)
+        warn = [r for r in rows if "not a number of hours" in r["message"]]
+        closed = [r for r in rows if "closed idle buffer" in r["message"]]
+        results.append(check("the valid value closed the first idle buffer",
+                             len(closed) == 1 and "proj-dead" in closed[0]["message"]))
+        results.append(check("the bad value prints a warning on the core buffer",
+                             any(r["buffer"] == "core.weechat"
+                                 and "auto-clean is off" in r["message"] for r in warn)))
+        results.append(check("sweeps while the value is bad close nothing",
+                             len(closed) == 1 and any("proj-late" in n for n in after)))
+        results.append(check("a later valid sweep uses the new value, not the old one",
+                             'python.pi_bridge.auto_clean = "24"' in conf
+                             and len(closed) == 1
+                             and any("proj-late" in n for n in after)))
+        results.append(check("the live buffer survives the bad value", "python.pi" in after))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
     print("\n%s (%d/%d checks)" % ("OK" if all(results) else "FAIL",
                                    sum(results), len(results)))
     return 0 if all(results) else 1

@@ -197,7 +197,16 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   await loadExt();
 
   await mock.fire("session_start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
+  await wc.waitFor((m) => m.type === "print" && m.text.includes(" has joined "), "buffer: pi joins");
+
+  // the join line takes WeeChat's own join prefix column (not the nick column)
+  // and carries the IRC-shaped tags a real join carries
+  const joinLine = wc.lines.filter(
+    (m) => m.type === "print" && (m.text || "").includes(" has joined ")
+  ).pop();
+  assert.ok(joinLine.prefix.includes("-->"), `join prefix: ${JSON.stringify(joinLine.prefix)}`);
+  assert.ok(joinLine.tags.includes("irc_join") && joinLine.tags.includes("nick_pi"),
+    `join tags: ${joinLine.tags}`);
 
   // session info + status render in the buffer
   await wc.waitFor(
@@ -208,14 +217,19 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     // with the same sessionId and reattaches to the SAME buffer
     const atDrop = wc.lines.length;
     wc.send({ op: "dropclient" });
-    await wc.waitFor(
-      (m) => m.type === "print" && m.text.includes("pi disconnected"),
-      "buffer: pi disconnected",
+    const quitLine = await wc.waitFor(
+      (m) => m.type === "print" && m.text.includes(" has quit "),
+      "buffer: pi quits",
       5000,
       atDrop
     );
+
+    // and the quit line reads the same way, with the reason for a peer hang-up
+    assert.ok(quitLine.prefix.includes("<--"), `quit prefix: ${JSON.stringify(quitLine.prefix)}`);
+    assert.ok(quitLine.tags.includes("irc_quit"), `quit tags: ${quitLine.tags}`);
+    assert.ok(quitLine.text.includes("(Client Quit)"), `quit reason: ${quitLine.text}`);
     await wc.waitFor(
-      (m) => m.type === "print" && m.text.includes("pi connected"),
+      (m) => m.type === "print" && m.text.includes(" has joined "),
       "buffer: pi reconnected (reattach by sessionId)",
       5000,
       atDrop
@@ -239,7 +253,7 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   await waitForMock(() => c2msgs.some((m) => m.type === "hello"), "second client: hello accepted");
   c2.write(JSON.stringify({ type: "session_info", cwd: "/tmp/itg2" }) + "\n");
   const c2connected = await wc.waitFor(
-    (m) => m.type === "print" && m.buffer && m.buffer !== "buffer" && m.text.includes("pi connected"),
+    (m) => m.type === "print" && m.buffer && m.buffer !== "buffer" && m.text.includes(" has joined "),
     "second client: connected in its own buffer",
     5000,
     atC2
@@ -417,15 +431,15 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   // buffer title tracks state
   await wc.waitFor((m) => m.type === "title" && /read_file/.test(m.text), "title: tool state");
 
-  // user types in the weechat buffer → pi.sendUserMessage
+  // user types in the weechat buffer → pi.sendUserMessage (plain text steers)
   wc.send({ op: "input", text: "hello from weechat" });
   await waitForMock(
-    () => mock.sentUserMessages.find((m) => m.text === "hello from weechat"),
-    "user_input delivered"
+    () => mock.sentUserMessages.find((m) => m.text === "hello from weechat" && m.deliverAs === "steer"),
+    "plain input delivered as steer"
   );
 
-  // !s steer prefix maps to deliverAs: steer
-  wc.send({ op: "input", text: "!s do it this way" });
+  // plain text also steers (no prefix needed)
+  wc.send({ op: "input", text: "do it this way" });
   await waitForMock(
     () => mock.sentUserMessages.find((m) => m.text === "do it this way" && m.deliverAs === "steer"),
     "steer delivered"
@@ -505,8 +519,8 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   // stop the extension cleanly before the child is killed
   await mock.fire("session_shutdown");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi disconnected"),
-    "buffer: disconnected after shutdown"
+    (m) => m.type === "print" && m.text.includes(" has quit "),
+    "buffer: quit line after shutdown"
   );
 });
 
@@ -543,8 +557,8 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
 
   // challenge → hello+proof → connected (peer IP in the buffer line)
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi connected from 127.0.0.1"),
-    "buffer: pi connected over tcp"
+    (m) => m.type === "print" && m.text.includes("(~pi@127.0.0.1)"),
+    "buffer: pi joins over tcp"
   );
 
   // session info renders
@@ -578,7 +592,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
     () => mock.sentUserMessages.find((m) => m.text === "hello over tcp"),
     "user_input delivered over tcp"
   );
-  wc.send({ op: "input", text: "!s steer over tcp" });
+  wc.send({ op: "input", text: "steer over tcp" });
   await waitForMock(
     () => mock.sentUserMessages.find((m) => m.text === "steer over tcp" && m.deliverAs === "steer"),
     "steer delivered over tcp"
@@ -598,7 +612,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   // ---------------- negative: wrong token ⇒ auth_failed + retries -------
   await mock.fire("session_shutdown");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi disconnected"),
+    (m) => m.type === "print" && m.text.includes(" has quit "),
     "buffer: disconnected before negative phase"
   );
 
@@ -663,14 +677,14 @@ test("integration: config file pi-weechat.json + env precedence", async (t) => {
   await loadExt();
   await mock.fire("session_start");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi connected from 127.0.0.1"),
-    "buffer: pi connected using config-file url+token"
+    (m) => m.type === "print" && m.text.includes("(~pi@127.0.0.1)"),
+    "buffer: pi joins using config-file url+token"
   );
 
   // --- phase 2: env token WINS over a wrong file token -------------------
   await mock.fire("session_shutdown");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi disconnected"),
+    (m) => m.type === "print" && m.text.includes(" has quit "),
     "buffer: disconnected before env-precedence phase"
   );
 
@@ -679,8 +693,8 @@ test("integration: config file pi-weechat.json + env precedence", async (t) => {
   wc.lines.length = 0; // drop phase-1 lines so waits only match fresh output
   await mock.fire("session_start"); // refreshConfig re-reads file + env
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi connected from 127.0.0.1"),
-    "buffer: pi connected with env token beating wrong file token"
+    (m) => m.type === "print" && m.text.includes("(~pi@127.0.0.1)"),
+    "buffer: pi joins with env token beating wrong file token"
   );
   assert.ok(
     !wc.lines.some((m) => m.type === "print" && m.text.includes("auth failed")),
@@ -723,8 +737,8 @@ test("integration: !cd + !pick round trip", async (t) => {
   await loadExt();
   await mock.fire("session_start");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi connected"),
-    "buffer: pi connected"
+    (m) => m.type === "print" && m.text.includes(" has joined "),
+    "buffer: pi joins"
   );
 
   // --- exact path: switches immediately, no prompt on the wire ----------
@@ -827,13 +841,13 @@ test("integration: assistant markdown renders through the real extension", async
   await loadExt();
   await mock.fire("session_start");
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("pi connected"),
+    (m) => m.type === "print" && m.text.includes(" has joined "),
     "buffer: connected"
   );
 
   // the stub weechat module maps colors to single letters and attributes to
-  // real control codes: M=magenta, E=yellow, BOLD/UNDER are raw \x1a codes
-  const BOLD = "\x1a\x01", UNDER = "\x1a\x04", R = "0";
+  // real control codes: M=magenta, E=yellow, BOLD/UNDER/reset are raw codes
+  const BOLD = "\x1a\x01", UNDER = "\x1a\x04", R = "\x1c";
 
   await mock.fire("agent_start");
   await mock.fire("message_start", { message: { role: "assistant" } });
@@ -892,6 +906,40 @@ test("integration: assistant markdown renders through the real extension", async
   assert.ok(wc.lines.indexOf(h2) < wc.lines.indexOf(tool), "heading prints before the tool line");
   assert.ok(wc.lines.indexOf(tool) < wc.lines.indexOf(after), "tool line before the following paragraph");
 
+  // a table: buffered while it streams, then one aligned grid
+  const DIM = "\x1a\x06";
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  for (const delta of ["| a | b |\n", "|---|---|\n", "| 1 | 22 |\n"]) {
+    await mock.fire("message_update", {
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+    });
+  }
+  await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+
+  const top = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "┌"),
+    "the table's top rule"
+  );
+  const headRow = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "│") && (m.text || "").includes(BOLD + "a"),
+    "the header row, bold"
+  );
+  const bodyRow = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "│") && (m.text || "").includes("22") &&
+      !(m.text || "").includes(BOLD),
+    "a body row, not bold"
+  );
+  assert.ok(wc.lines.indexOf(top) < wc.lines.indexOf(headRow) &&
+            wc.lines.indexOf(headRow) < wc.lines.indexOf(bodyRow), "grid lines in order");
+  assert.ok(wc.lines.indexOf(top) > wc.lines.indexOf(after),
+    "the grid prints only once the table is over: the widths need every row");
+  const joints = (top.text.match(/┬/g) || []).length;
+  assert.equal((headRow.text.match(/│/g) || []).length, joints + 2,
+    "header columns line up with the joints of the rule");
+  assert.equal((bodyRow.text.match(/│/g) || []).length, joints + 2, "body columns too");
+  assert.ok(!wc.lines.some((m) => m.type === "print" && (m.text || "").includes("| a | b |")),
+    "the source row is not printed next to the grid");
   // !markdown off: the very same text arrives with its markers
   wc.send({ op: "input", text: "!markdown off" });
   await wc.waitFor(

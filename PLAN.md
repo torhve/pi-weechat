@@ -92,7 +92,7 @@ confidentiality is the VPN's job (§6).
 
 | type (new in v3) | payload | direction | meaning |
 |---|---|---|---|
-| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
+| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. The "?" title line is tagged `notify_highlight` (same level as the ready banner), so an off-screen buffer pings. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
 | `ui_response` | answer: `{id, value}` (string; array when multiple) · cancel: `{id, cancelled:true}` | WeeChat → pi | answer to `ui_request`; `value` is the picked option text(s) or the entered free text. Stale/unknown ids are ignored on the pi side |
 | `ui_cancel` | `{id}` | pi → WeeChat | pi stopped waiting for that prompt (timeout, abort, or answered in the pi terminal in mirror mode); the buffer drops its pending `!pick` prompt when the id matches. Unknown ids are ignored, and older peers ignore the message entirely |
 
@@ -127,15 +127,14 @@ listener.
 | type        | payload                          | meaning                                        |
 |-------------|----------------------------------|------------------------------------------------|
 | `hello`     | as above                         | handshake                                      |
-| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`). The pi side fills in `"followUp"` for plain input that arrives while a turn is running, so nothing is dropped |
+| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ `"steer"` (default for plain input → mid-stream steering; ignored by pi when idle), `"followUp"` (`!q ...`). The pi side also fills in `"steer"` for plain input that arrives while a turn is running, so nothing is dropped |
 | `command`   | `{name, arg?}`                   | name ∈ `new_session`, `compact`, `abort`, `status`, `model`, `cd`; `arg` carries the optional argument (e.g. model id for `model`, path for `cd`). `abort` runs `ctx.abort()` directly (safe from event handlers); the rest are routed through a registered extension command (`/weechat-ctl <name> [arg]`) sent with `expandPromptTemplates: true` so it executes immediately — even mid-stream. `cd` is handled built-in by the bridge (no LLM round trip): exact existing dir ⇒ immediate session switch; otherwise fuzzy-similar dirs + a “➕ create … as new project” option are offered as a `ui_request`, answered with `!pick` |
 | `pong`      | `{ts}`                           | keepalive response                             |
 
 Buffer-local commands typed in the WeeChat buffer (all start with `!` so they
 never reach the LLM):
 
-- `!s <text>`  — steer (interrupt current stream, inject)
-- `!q <text>`  — queue follow-up message
+- `!q <text>`  — queue follow-up message (plain text steers the running turn by default)
 - `!new`       — new session (`ctx.newSession()`)
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
@@ -184,6 +183,10 @@ Design:
   rejected with `error{code: "session_id_in_use"}`. Up to 3 in-flight
   handshakes are held, then closed silently. Client fds are non-blocking in
   both transports, with the shared `rxbuff` + write-hook backpressure model.
+  Every Session picked by a hello is guaranteed a buffer before it renders: one
+  that auto-clean or a manual `/buffer close` removed is recreated by the next
+  hello, and a hello whose id differs from the Session's current one updates the
+  reattach mapping only while that mapping still points to the same Session.
 - **Reader:** accumulate in a buffer, split on `\n`, JSON-parse each line,
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
@@ -233,9 +236,23 @@ Design:
     and re-applied live on change via `hook_config` (no reload). If that
     option is empty, missing, or the IRC plugin is not loaded, the localvar
     is cleared and user lines fall back to the legacy `> ` marker via
-    `prnt`. System lines (session info, connection state, command status,
-    errors) stay prefix-less (`prnt`). Message body colors are unchanged —
-    only the prefix column moves.
+    `prnt`. System lines (session info, command status, errors) stay
+    prefix-less (`prnt`). Message body colors are unchanged — only the prefix
+    column moves.
+  - **Join / quit lines (connection lifecycle):** an accepted `hello` prints a
+    join line and a closed connection prints a quit line, shaped the way the IRC
+    plugin shapes its own. WeeChat's own `prefix("join")` / `prefix("quit")`
+    (color + `-->` / `<--` + TAB) rides in front of the body in one
+    `prnt_date_tags`, so the line lands in the prefix column instead of the nick
+    column: `pi (~pi@172.16.36.212) has joined #pi:~/proj`. Tags are `irc_join` /
+    `irc_quit`, `nick_pi`, `host_pi@<host>`, `notify_none` — deliberately no
+    `irc_smart_filter`, so WeeChat can never fold these lines away. The hostmask
+    is the real peer address, or `localhost` for the Unix socket. The reason says
+    who closed: `(Client Quit)` when pi hung up, `(Connection reset by peer)` on
+    a socket error, `(Connection closed)` when the bridge dropped a client it
+    still owns. `Bridge.unloading` (set by `cleanup()`) stops the printing while
+    the script unloads, because those buffers are going away. A connection that
+    never authenticated owns no session, so a rejected handshake joins nothing.
   - `assistant_line`: rendered as markdown, block by block
     (`pi_bridge.markdown`, `!markdown`, on by default). Fenced code blocks
     are tracked per message (`msgId`) and stream straight through, line by
@@ -245,14 +262,26 @@ Design:
     line tokenizer (ordered regex alternation; block-comment state carried per
     fence). Toggled by `pi_bridge.highlight` (`!highlight`, default on);
     unknown languages render plain but stay indented. Every other line is
-    accumulated into a block (paragraph, list, quote, heading, rule, setext)
-    and printed when the block completes, so the renderer sees the whole
+    accumulated into a block (paragraph, list, quote, heading, rule, setext,
+    table) and printed when the block completes, so the renderer sees the whole
     construct: ATX/setext headings (magenta, tiered by level), bold/italic
     (`**`/`*` with backslash escapes, no in-word emphasis), ~~strikethrough~~
     via a per-character U+0336 combining stroke overlay (no WeeChat attribute
-    exists for it), yellow inline code, bulleted lists (`•`/`◦`/`▪`, hanging continuation), `│`-barred dim
-    quotes, and a fixed 20-column `─` rule (v1 does not query the window
-    width, so nothing is padded and the renderer never hard-wraps). A block
+    exists for it), yellow inline code, bulleted lists (`•`/`◦`/`▪`, hanging
+    continuation), `│`-barred dim quotes, a fixed 20-column `─` rule, and
+    GFM tables as a box-drawing grid (`┌─┬─┐` above, one rule under the header,
+    `│` at every column boundary, columns padded to their widest cell, colon
+    alignment, bold header, dim frame, cells rendered through the inline path,
+    escaped pipes and pipes inside code spans kept). A table inside a quote
+    keeps its grid behind the quote bar; inside a list item it stays text.
+    Column widths come from `weechat.strlen_screen` where the binding exists
+    (otherwise a local east-asian-width measure over the rendered text), so a
+    bold or struck cell reserves only the columns it displays. v1 does not query
+    the window width: nothing is padded to a guess, the renderer never
+    hard-wraps, and WeeChat's own word wrap breaks a grid wider than the window.
+    A table the stream never finishes still prints, as the grid of the rows that
+    made it; past `MD_TABLE_MAX_ROWS`/`MD_TABLE_MAX_BYTES` the block degrades to
+    the text as pi wrote it. A block
     remembers the mode it started under, so a live `!markdown` toggle never
     re-renders text already on screen; with markdown off, lines print as-is.
     Blank-line separators are deferred (printed before the NEXT block, so a
@@ -284,6 +313,27 @@ Design:
   `agent_start`; Pi UI prompt events pause both clocks on runtimes that emit them,
   WeeChat `!pick` waits always pause, and tool execution counts as turn time.
 - **Cleanup:** on close callback / WeeChat quit, unhook fd, unlink socket file.
+- **Idle-buffer sweep (`pi_bridge.auto_clean`, default 24 hours):**
+  `Bridge.sweep_idle_sessions()` runs once an hour on a single `hook_timer`
+  (`pi_auto_clean_cb`) and once on every `/set` of the option (`pi_config_cb`),
+  both on WeeChat's main thread, with `Bridge._sweeping` blocking any overlap.
+  It walks a copy of `Bridge.sessions` and closes a buffer whose connection is
+  gone and whose newest printed line is older than `auto_clean` hours. That date
+  comes from `_last_line_date(buffer)` — the `buffer_lines` infolist walked with
+  `infolist_prev` (newest line first), `infolist_time(…, "date")` in epoch
+  seconds, date-0 lines skipped — and `_line_age(now, date)` turns it into
+  seconds (missing/zero date → no age, implausibly large value read as
+  milliseconds, future date read as just printed). Sessions holding a live
+  connection are never touched, and neither is a buffer shown in a window
+  (`first_window` / `current_buffer()`, hint printed instead), the current
+  buffer, or a buffer with text on its input line. `buffer_close()` fires
+  `pi_close_cb` inside the call, so the pointer is dead when it returns: the
+  teardown drops the Session from `sessions`, `session_by_buffer`, and
+  `session_by_id` **by object identity**, and the notice is printed to the core
+  buffer, never to the closed one. A session with neither a connection nor a
+  buffer is dropped from the registries, and a closed buffer's name is reusable
+  at once. A reaped `sessionId` is forgotten, so a reconnect under it starts a
+  new session with a new buffer.
 
 ## 4. Pi side — `extensions/weechat-bridge.ts` (pi package)
 
@@ -324,8 +374,10 @@ Structure (single file is fine at this size; split if it grows):
 - **Input handling:** on `user_input`, call
   `pi.sendUserMessage(text, { deliverAs })`. Plain input that arrives while a
   turn is streaming (`agent_start` without `agent_settled`) gets
-  `deliverAs: "followUp"` — otherwise pi's `prompt()` throws "Agent is already
-  processing" and the message would vanish with no error visible in WeeChat.
+  `deliverAs: "steer"` (injected mid-stream) — otherwise pi's `prompt()`
+  throws "Agent is already processing" and the message would vanish with no
+  error visible in WeeChat. When pi is idle, `steer` is simply ignored and
+  the message starts a new turn.
   Because injected messages arrive back at pi with
   `event.source === "extension"`, the `input` handler skips them for
   `user_echo` — no echo loops.
@@ -358,9 +410,10 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
   WeeChat's redrawing stays cheap.
 - Tool output > 8 KiB is truncated for display but chunked intact if the
   WeeChat side later requests it (`!tool <id>` → fetch full output; v2).
-- If pi reconnects mid-turn, WeeChat prints a `— reconnected —` separator and
-  pi sends fresh `session_info`, status, and timing snapshots. The Pi-owned
-  elapsed counters continue from Pi's monotonic state and stop when Pi reports
+- If pi reconnects mid-turn, WeeChat prints the quit line for the dead connection
+  and the join line for the reattached one, and pi sends fresh `session_info`,
+  status, and timing snapshots. The Pi-owned elapsed counters continue from
+  Pi's monotonic state and stop when Pi reports
   the run inactive; WeeChat does not extrapolate a stale snapshot while disconnected.
 
 ## 6. Security
@@ -399,7 +452,8 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.tool_output` | WeeChat option (`/set plugins.var.python.pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
 | `pi_bridge.highlight` | WeeChat option (`/set plugins.var.python.pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
 | `pi_bridge.nicks` | WeeChat option (`/set plugins.var.python.pi_bridge.nicks auto\|pi`, or `!nick <mode>` in the buffer) — `auto`: nick column names the tool on tool lines, `think` on thinking lines, `pi` on replies; `pi`: every pi-side line under the single nick `pi` | `auto` |
-| `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules) | `on` |
+| `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules, table grids) | `on` |
+| `pi_bridge.auto_clean` | WeeChat option (`/set plugins.var.python.pi_bridge.auto_clean <hours>`; `0` = disabled) — how many hours a buffer whose pi connection is gone may print nothing before `Bridge.sweep_idle_sessions()` closes it. Idle age is the buffer's last printed line date; the sweep runs on one hourly `hook_timer` and once per `/set` of the option; a buffer with a live connection, shown in a window, current, or holding input text is skipped | `24` |
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
